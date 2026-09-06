@@ -28,9 +28,9 @@ variable "instance_type" {
 }
 
 variable "ami_id" {
-  description = "Amazon Linux 2023 AMI ID to use for the EC2 instance."
+  description = "Ubuntu 24.04 LTS AMI ID to use for the EC2 instance. Leave empty to auto-discover latest Ubuntu 24.04 LTS in the selected region."
   type        = string
-  default     = "ami-0c101f26f147fa7fd"
+  default     = ""
 }
 
 # ------------------------------------------------------------------------------

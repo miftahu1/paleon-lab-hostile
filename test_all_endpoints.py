@@ -5,8 +5,9 @@ import sys
 import threading
 import time
 import requests
+from pathlib import Path
 
-sys.path.insert(0, 'C:/Users/mifta/Desktop/Paleon/Test Sites/hostile/app')
+sys.path.insert(0, str(Path(__file__).parent / 'app'))
 import app
 
 # Start Flask app in background thread

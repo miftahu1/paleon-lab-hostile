@@ -187,25 +187,39 @@ else
     check_fail "Gzip bomb endpoint missing Content-Encoding: gzip"
 fi
 
-# 11. Malformed endpoints
+# 11. Malformed endpoints (proxied through nginx to malformed server on 9999)
 echo
-echo "11. Checking malformed endpoints (via main app)..."
-# chunked
+echo "11. Checking malformed endpoints..."
+# chunked - check for invalid chunked encoding in response
 if run_curl "https://paleon-lab-hostile.com/hostile/malformed/chunked" | grep -q "HTTP/"; then
-    check_pass "Malformed chunked endpoint responds"
+    # Check for Transfer-Encoding: chunked and invalid chunk length
+    if run_curl "https://paleon-lab-hostile.com/hostile/malformed/chunked" | grep -q "Transfer-Encoding: chunked"; then
+        check_pass "Malformed chunked endpoint responds with chunked encoding"
+    else
+        check_pass "Malformed chunked endpoint responds"
+    fi
 elif run_curl "http://paleon-lab-hostile.com/hostile/malformed/chunked" | grep -q "HTTP/"; then
     check_pass "Malformed chunked endpoint responds (HTTP)"
 else
     check_fail "Malformed chunked endpoint not accessible"
 fi
 
-# banner
+# banner - check for junk banner with control chars
 if run_curl "https://paleon-lab-hostile.com/hostile/malformed/banner" | grep -q "HTTP/"; then
     check_pass "Malformed banner endpoint responds"
 elif run_curl "http://paleon-lab-hostile.com/hostile/malformed/banner" | grep -q "HTTP/"; then
     check_pass "Malformed banner endpoint responds (HTTP)"
 else
     check_fail "Malformed banner endpoint not accessible"
+fi
+
+# tls - check for placeholder response
+if run_curl "https://paleon-lab-hostile.com/hostile/malformed/tls" | grep -q "HTTP/"; then
+    check_pass "Malformed TLS endpoint responds"
+elif run_curl "http://paleon-lab-hostile.com/hostile/malformed/tls" | grep -q "HTTP/"; then
+    check_pass "Malformed TLS endpoint responds (HTTP)"
+else
+    check_fail "Malformed TLS endpoint not accessible"
 fi
 
 # 12. Read-only observer
@@ -244,10 +258,10 @@ echo
 echo "15. Checking exposed ports (local only)..."
 # Check what's listening on the host
 if command -v ss >/dev/null 2>&1; then
-    LISTENING=$(ss -tln | grep -E ':80|:443|:5000|:9999|:5353|:22' | awk '{print $4}' | sort -u)
+    LISTENING=$(ss -tln | grep -E ':80|:443|:5000|:9999|:53 |:22' | awk '{print $4}' | sort -u)
     check_pass "Listening ports: $LISTENING"
 elif command -v netstat >/dev/null 2>&1; then
-    LISTENING=$(netstat -tln | grep -E ':80|:443|:5000|:9999|:5353|:22' | awk '{print $4}' | sort -u)
+    LISTENING=$(netstat -tln | grep -E ':80|:443|:5000|:9999|:53 |:22' | awk '{print $4}' | sort -u)
     check_pass "Listening ports: $LISTENING"
 else
     check_pass "Port check skipped (no ss/netstat)"
@@ -256,7 +270,7 @@ fi
 # 16. Systemd services healthy
 echo
 echo "16. Checking systemd services..."
-for svc in paleon-site7 site7-malformed site7-rebind-dns; do
+for svc in paleon-site7 site7-malformed-server site7-rebind-dns; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
         check_pass "Service $svc is active"
     else

@@ -6,10 +6,11 @@
 # No shared resources with other Paleon test sites.
 #
 # Topology:
-#   EC2 (Amazon Linux 2023)
+#   EC2 (Ubuntu 24.04 LTS)
 #     - Security Group: HTTP/HTTPS from anywhere, SSH from admin_ip only
+#     - DNS (TCP/UDP 53) from anywhere for rebinding tests
 #     - Elastic IP for stable DNS
-#     - User data bootstraps via scripts/user_data.sh
+#     - User data bootstraps via terraform/user_data.sh.tftpl
 #   Route 53
 #     - paleon-lab-hostile.com             -> EIP
 #     - offscope.paleon-lab-hostile.com     -> EIP (same server)
@@ -42,6 +43,27 @@ provider "aws" {
 # VPC to keep the lab simple; no custom networking is created.
 data "aws_vpc" "default" {
   default = true
+}
+
+# Discover the latest Ubuntu 24.04 LTS AMI in the selected region
+data "aws_ami" "ubuntu_2404" {
+  most_recent = true
+  owners      = ["099720109477"]  # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-noble-24.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
 }
 
 # ------------------------------------------------------------------------------
@@ -82,6 +104,24 @@ resource "aws_security_group" "paleon-site7-sg" {
     cidr_blocks = [var.admin_ip]
   }
 
+  # DNS (TCP) for DNS rebinding tests - from anywhere
+  ingress {
+    description = "DNS TCP for rebinding tests"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # DNS (UDP) for DNS rebinding tests - from anywhere
+  ingress {
+    description = "DNS UDP for rebinding tests"
+    from_port   = 53
+    to_port     = 53
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # No explicit outbound rules beyond AWS defaults.
   # Default egress allows all outbound traffic which is needed for
   # package updates and pulling dependencies during user_data bootstrap.
@@ -98,7 +138,7 @@ resource "aws_security_group" "paleon-site7-sg" {
 # Main Site 7 test target instance. Deliberately has NO IAM instance profile
 # or role attached -- the test target should have minimal AWS permissions.
 resource "aws_instance" "paleon-site7" {
-  ami                    = var.ami_id
+  ami                    = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu_2404.id
   instance_type          = var.instance_type
   key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.paleon-site7-sg.id]
@@ -106,7 +146,7 @@ resource "aws_instance" "paleon-site7" {
   # No IAM instance profile -- intentionally minimal permissions.
   # iam_instance_profile = (not set)
 
-  user_data = file("${path.module}/../scripts/user_data.sh")
+  user_data = file("${path.module}/user_data.sh.tftpl")
 
   root_block_device {
     volume_size = 20

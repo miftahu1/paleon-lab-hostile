@@ -23,8 +23,8 @@ import time
 from pathlib import Path
 
 # Configuration
-DNS_HOST = "127.0.0.1"
-DNS_PORT = 5353
+DNS_HOST = "0.0.0.0"
+DNS_PORT = 53
 PUBLIC_IP = "93.184.216.34"  # Documentation/test address
 PRIVATE_IP = "192.168.1.1"
 REBIND_HOSTNAME = "rebind-test.paleon-lab-hostile.com"

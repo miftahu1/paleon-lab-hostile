@@ -1,439 +1,106 @@
 #!/usr/bin/env bash
 # PALEON SITE 7 — HOSTILE TEST TARGET — BOOTSTRAP SCRIPT (Terraform Template)
 # Self-contained, idempotent, retry-safe bootstrap
+# Deploys the actual application files from the GitHub repository
 set -euo pipefail
 
 DOMAIN_NAME="${domain_name}"
 APP_DIR="/opt/paleon-site7"
 DATA_DIR="/var/lib/site7"
 LOG_FILE="/var/log/paleon-site7-bootstrap.log"
+REPO_URL="https://github.com/miftahu1/paleon-site7.git"
 
 echo "=== PALEON SITE 7 BOOTSTRAP START ==="
 echo "Domain: $DOMAIN_NAME"
 echo "Starting at $(date)"
 
 # 1. System update and prerequisites
-echo "[1/14] Updating system and installing prerequisites..."
+echo "[1/12] Updating system and installing prerequisites..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >> "$LOG_FILE" 2>&1 || true
 apt-get upgrade -y >> "$LOG_FILE" 2>&1 || true
 apt-get install -y python3 python3-pip nginx certbot python3-certbot-nginx git >> "$LOG_FILE" 2>&1 || true
 
 # 2. Create system user 'site7'
-echo "[2/14] Creating system user 'site7'..."
+echo "[2/12] Creating system user 'site7'..."
 if id -u site7 >/dev/null 2>&1; then
     echo "User site7 already exists, skipping creation"
 else
     useradd --system --shell /bin/false --home-dir "$DATA_DIR" --create-home site7
 fi
 
-# 3. Create application directory
-echo "[3/14] Creating application directory..."
+# 3. Create application directory structure
+echo "[3/12] Creating application directory..."
 mkdir -p "$APP_DIR"
 mkdir -p "$DATA_DIR/observations"
 mkdir -p "$DATA_DIR/rebind"
 mkdir -p "$DATA_DIR/temp"
 
-# 4. Deploy Flask app and requirements
-echo "[4/14] Deploying application files..."
-cat > "$APP_DIR/app.py" << 'APPEOF'
-#!/usr/bin/env python3
-# PALEON SITE 7 — HOSTILE TEST TARGET — MAIN FLASK APPLICATION
-import json
-import time
-import gzip
-import logging
-from datetime import datetime
-from pathlib import Path
-from flask import Flask, Response, request, jsonify, redirect
-
-app = Flask(__name__)
-
-DATA_DIR = Path("/var/lib/site7")
-OBS_DIR = DATA_DIR / "observations"
-OBS_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("paleon-site7")
-
-def log_observation(event_type, details):
-    entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "event_type": event_type,
-        "client_ip": request.remote_addr,
-        "user_agent": request.headers.get("User-Agent", ""),
-        "details": details
+# 4. Deploy application from repository
+echo "[4/12] Cloning application repository..."
+if [ -d "$APP_DIR/.git" ]; then
+    echo "Repository exists, pulling latest..."
+    cd "$APP_DIR"
+    git pull origin main >> "$LOG_FILE" 2>&1 || true
+else
+    rm -rf "$APP_DIR"
+    git clone "$REPO_URL" "$APP_DIR" >> "$LOG_FILE" 2>&1 || {
+        echo "[ERROR] Failed to clone repository"
+        exit 1
     }
-    obs_file = OBS_DIR / f"observations_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
-    with open(obs_file, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    cd "$APP_DIR"
+fi
 
-@app.route("/hostile/ssrf/fargate")
-def ssrf_fargate():
-    log_observation("ssrf_redirect_attempt", {"target": "fargate", "redirect_to": "http://169.254.170.2"})
-    return redirect("http://169.254.170.2/v2/credentials", code=302)
-
-@app.route("/hostile/ssrf/imds")
-def ssrf_imds():
-    log_observation("ssrf_redirect_attempt", {"target": "imds", "redirect_to": "http://169.254.169.254"})
-    return redirect("http://169.254.169.254/latest/meta-data/", code=302)
-
-@app.route("/hostile/ssrf/rfc1918")
-def ssrf_rfc1918():
-    log_observation("ssrf_redirect_attempt", {"target": "rfc1918", "redirect_to": "http://10.0.0.1"})
-    return redirect("http://10.0.0.1/admin", code=302)
-
-@app.route("/hostile/ssrf/localhost")
-def ssrf_localhost():
-    log_observation("ssrf_redirect_attempt", {"target": "localhost", "redirect_to": "http://127.0.0.1"})
-    return redirect("http://127.0.0.1:8080/internal", code=302)
-
-@app.route("/hostile/ssrf/ipv6-loopback")
-def ssrf_ipv6_loopback():
-    log_observation("ssrf_redirect_attempt", {"target": "ipv6-loopback", "redirect_to": "http://[::1]"})
-    return redirect("http://[::1]:8080/internal", code=302)
-
-@app.route("/hostile/ssrf/ipv6-private")
-def ssrf_ipv6_private():
-    log_observation("ssrf_redirect_attempt", {"target": "ipv6-private", "redirect_to": "http://[fc00::1]"})
-    return redirect("http://[fc00::1]/internal", code=302)
-
-@app.route("/hostile/scope-escape")
-def scope_escape():
-    log_observation("scope_escape_attempt", {"redirect_to": "https://offscope.paleon-lab-hostile.com"})
-    return redirect("https://offscope.paleon-lab-hostile.com/", code=302)
-
-@app.route("/hostile/redirect-loop")
-@app.route("/hostile/redirect-loop/<int:step>")
-def redirect_loop(step=1):
-    log_observation("redirect_loop_attempt", {"step": step})
-    if step >= 5:
-        return Response(
-            f"Redirect loop terminated at step {step}. Scanner should stop here.",
-            status=200,
-            mimetype="text/plain"
-        )
-    else:
-        next_step = step + 1
-        return redirect(f"/hostile/redirect-loop/{next_step}", code=302)
-
-@app.route("/hostile/large-body")
-def large_body():
-    log_observation("resource_safety_test", {"test": "large-body", "size": 15000000})
-    def generate():
-        chunk = b"X" * 1024 * 1024
-        for _ in range(15):
-            yield chunk
-    return Response(
-        generate(),
-        status=200,
-        mimetype="application/octet-stream",
-        headers={"Content-Length": "15728640"}
-    )
-
-@app.route("/hostile/slow-body")
-def slow_body():
-    log_observation("resource_safety_test", {"test": "slow-body", "duration_seconds": 5})
-    def generate():
-        for i in range(50):
-            yield f"Chunk {i}\n".encode()
-            time.sleep(0.1)
-    return Response(generate(), status=200, mimetype="text/plain")
-
-@app.route("/hostile/gzip-bomb")
-def gzip_bomb():
-    log_observation("resource_safety_test", {"test": "gzip-bomb", "compressed_size": 1000, "uncompressed_size": 100000000})
-    uncompressed = "A" * 100000000
-    compressed = gzip.compress(uncompressed.encode())
-    return Response(
-        compressed,
-        status=200,
-        mimetype="application/gzip",
-        headers={"Content-Encoding": "gzip", "Content-Length": str(len(compressed))}
-    )
-
-@app.route("/hostile/malformed/chunked")
-def malformed_chunked():
-    log_observation("parser_safety_test", {"test": "malformed-chunked"})
-    def generate():
-        yield b"5\r\nHello\r\n"
-        yield b"GARBAGE\r\n"
-        yield b"5\r\nWorld\r\n"
-        yield b"0\r\n\r\n"
-    return Response(generate(), status=200, headers={"Transfer-Encoding": "chunked"})
-
-@app.route("/hostile/malformed/banner")
-def malformed_banner():
-    log_observation("parser_safety_test", {"test": "malformed-banner"})
-    return Response("Body content", status=999, mimetype="text/plain")
-
-@app.route("/hostile/read-only")
-def read_only():
-    log_observation("passive_safety_check", {"endpoint": "read-only", "method": request.method})
-    if request.method != "GET":
-        log_observation("passive_safety_violation", {"method": request.method, "endpoint": "read-only"})
-        return Response("Method not allowed", status=405)
-    return jsonify({"status": "ok", "message": "Read-only endpoint - no state changes", "test_id": "SAFE-005"})
-
-@app.route("/hostile/kill-test")
-def kill_test():
-    log_observation("termination_safety_check", {"test": "kill-test"})
-    return jsonify({"status": "ok", "message": "Kill test endpoint - scanner should handle termination cleanly", "test_id": "SAFE-006"})
-
-@app.route("/internal/site7-observation")
-def observation_logs():
-    log_observation("observation_access", {"accessed_by": request.remote_addr})
-    logs = []
-    for obs_file in sorted(OBS_DIR.glob("*.jsonl"))[-1:]:
-        with open(obs_file) as f:
-            for line in f:
-                if line.strip():
-                    logs.append(json.loads(line))
-    return jsonify({"observations": logs[-100:], "total_files": len(list(OBS_DIR.glob("*.jsonl")))})
-
-@app.route("/")
-def index():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>PALEON SITE 7 — Hostile Test Target</title>
-        <style>
-            body { font-family: monospace; max-width: 800px; margin: 2rem auto; padding: 1rem; }
-            .endpoint { background: #f5f5f5; padding: 0.5rem; margin: 0.5rem 0; border-left: 4px solid #666; }
-            .critical { border-color: #d00; }
-            .high { border-color: #d80; }
-            .medium { border-color: #080; }
-        </style>
-    </head>
-    <body>
-        <h1>PALEON SITE 7 — Hostile Test Target</h1>
-        <p>Sector: hostile-target | Description: Adversarial target for scanner resilience validation</p>
-        <h2>Resilience Test Endpoints</h2>
-        <div class="endpoint critical"><strong>SSRF-001</strong> <code>GET /hostile/ssrf/fargate</code> — Redirect to Fargate credentials (169.254.170.2)</div>
-        <div class="endpoint critical"><strong>SSRF-002</strong> <code>GET /hostile/ssrf/imds</code> — Redirect to EC2 IMDS (169.254.169.254)</div>
-        <div class="endpoint critical"><strong>SSRF-003</strong> <code>GET /hostile/ssrf/rfc1918</code> — Redirect to RFC1918 (10.0.0.1)</div>
-        <div class="endpoint critical"><strong>SSRF-004</strong> <code>GET /hostile/ssrf/localhost</code> — Redirect to localhost (127.0.0.1)</div>
-        <div class="endpoint critical"><strong>SSRF-004</strong> <code>GET /hostile/ssrf/ipv6-loopback</code> — Redirect to IPv6 loopback ([::1])</div>
-        <div class="endpoint critical"><strong>SSRF-004</strong> <code>GET /hostile/ssrf/ipv6-private</code> — Redirect to IPv6 ULA (fc00::)</div>
-        <div class="endpoint high"><strong>SAFE-001</strong> <code>GET /hostile/scope-escape</code> — Redirect to off-scope host</div>
-        <div class="endpoint high"><strong>SAFE-002</strong> <code>GET /hostile/redirect-loop</code> — 5-step redirect loop</div>
-        <div class="endpoint high"><strong>SAFE-003</strong> <code>GET /hostile/large-body</code> — 15MB response</div>
-        <div class="endpoint high"><strong>SAFE-003</strong> <code>GET /hostile/slow-body</code> — Slow drip-feed response</div>
-        <div class="endpoint high"><strong>SAFE-003</strong> <code>GET /hostile/gzip-bomb</code> — Gzip bomb (100MB→1KB)</div>
-        <div class="endpoint high"><strong>SAFE-004</strong> <code>GET /hostile/malformed/chunked</code> — Malformed chunked encoding</div>
-        <div class="endpoint high"><strong>SAFE-004</strong> <code>GET /hostile/malformed/banner</code> — Malformed HTTP status</div>
-        <div class="endpoint high"><strong>SAFE-005</strong> <code>GET /hostile/read-only</code> — Passive safety check</div>
-        <div class="endpoint medium"><strong>SAFE-006</strong> <code>GET /hostile/kill-test</code> — Termination safety</div>
-        <h2>Internal Endpoints</h2>
-        <div class="endpoint"><code>GET /internal/site7-observation</code> — Observation logs (JSON)</div>
-        <p><strong>Note:</strong> All SSRF and scope-escape endpoints return HTTP 302 redirects. Scanners MUST inspect Location headers but NOT follow these redirects.</p>
-    </body>
-    </html>
-    """
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "healthy", "service": "paleon-site7"})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
-APPEOF
-
-cat > "$APP_DIR/malformed_server.py" << 'MALFORMEDEOF'
-#!/usr/bin/env python3
-# PALEON SITE 7 — MALFORMED RESPONSE SERVER
-import socket
-import time
-
-def run_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", 5001))
-    server.listen(5)
-    print("Malformed server listening on port 5001")
-    while True:
-        conn, addr = server.accept()
-        try:
-            request = conn.recv(4096).decode(errors="ignore")
-            if "/malformed/no-status" in request:
-                response = "Content-Type: text/plain\r\nX-Malformed: no-status-line\r\n\r\nBody without status line"
-            elif "/malformed/bad-header" in request:
-                response = "HTTP/1.1 200 OK\r\nInvalid-Header-Without-Colon\r\nContent-Type: text/plain\r\n\r\nBody with bad header"
-            elif "/malformed/no-crlf" in request:
-                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-No-CRLF: valueContent-Length: 20\r\n\r\nBody with missing CRLF"
-            elif "/malformed/bad-chunk" in request:
-                response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\ndata\r\n0\r\n\r\n"
-            elif "/malformed/premature-close" in request:
-                response = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nPartial"
-                conn.send(response.encode())
-                conn.close()
-                continue
-            elif "/malformed/null-bytes" in request:
-                response = "HTTP/1.1 200 OK\r\nX-Null: val\x00ue\r\nContent-Type: text/plain\r\n\r\nBody with null in header"
-            else:
-                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nMalformed server default response"
-            conn.send(response.encode())
-            time.sleep(0.1)
-        except Exception as e:
-            print(f"Error: {e}")
-        finally:
-            conn.close()
-
-if __name__ == "__main__":
-    run_server()
-MALFORMEDEOF
-
-cat > "$APP_DIR/rebind_dns.py" << 'REBINDEOF'
-#!/usr/bin/env python3
-# PALEON SITE 7 — DNS REBINDING SIMULATOR
-import json
-import socket
-import threading
-import time
-from pathlib import Path
-
-STATE_FILE = Path("/var/lib/site7/rebind-state.json")
-STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-DEFAULT_STATE = {"query_count": 0, "state": "public"}
-PUBLIC_IP = "203.0.113.42"
-PRIVATE_IP = "10.0.0.50"
-
-def load_state():
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return DEFAULT_STATE.copy()
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-def dns_server():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", 8053))
-    print("DNS rebinding server listening on UDP port 8053")
-    while True:
-        data, addr = sock.recvfrom(512)
-        try:
-            query = parse_dns_query(data)
-            if query:
-                state = load_state()
-                state["query_count"] += 1
-                if state["query_count"] == 1:
-                    response_ip = PUBLIC_IP
-                    state["state"] = "public"
-                else:
-                    response_ip = PRIVATE_IP
-                    state["state"] = "rebound"
-                save_state(state)
-                print(f"DNS query #{state['query_count']} for {query} -> {response_ip} ({state['state']})")
-                response = build_dns_response(data, response_ip)
-                sock.sendto(response, addr)
-        except Exception as e:
-            print(f"DNS error: {e}")
-
-def parse_dns_query(data):
-    try:
-        idx = 12
-        labels = []
-        while idx < len(data):
-            length = data[idx]
-            if length == 0:
-                break
-            if length & 0xC0:
-                break
-            idx += 1
-            if idx + length <= len(data):
-                labels.append(data[idx:idx+length].decode())
-                idx += length
-        return ".".join(labels)
-    except Exception:
-        return None
-
-def build_dns_response(query_data, ip):
-    tid = query_data[:2]
-    flags = b"\x81\x80"
-    qdcount = b"\x00\x01"
-    ancount = b"\x00\x01"
-    nscount = b"\x00\x00"
-    arcount = b"\x00\x00"
-    question = query_data[12:]
-    aname = b"\xC0\x0C"
-    atype = b"\x00\x01"
-    aclass = b"\x00\x01"
-    ttl = b"\x00\x00\x00\x00"
-    rdlength = b"\x00\x04"
-    rdata = socket.inet_aton(ip)
-    return tid + flags + qdcount + ancount + nscount + arcount + question + aname + atype + aclass + ttl + rdlength + rdata
-
-def http_server():
-    from flask import Flask, request, jsonify
-    app = Flask(__name__)
-    @app.route("/")
-    def index():
-        state = load_state()
-        return jsonify({"service": "rebind-test", "state": state["state"], "query_count": state["query_count"], "current_ip": PUBLIC_IP if state["state"] == "public" else PRIVATE_IP})
-    @app.route("/rebind-test")
-    def rebind_test():
-        state = load_state()
-        return jsonify({"test": "SAFE-007", "message": "DNS rebinding test endpoint", "dns_state": state["state"], "query_count": state["query_count"], "client_ip": request.remote_addr})
-    app.run(host="0.0.0.0", port=5002, debug=False)
-
-if __name__ == "__main__":
-    dns_thread = threading.Thread(target=dns_server, daemon=True)
-    dns_thread.start()
-    http_server()
-REBINDEOF
-
-cat > "$APP_DIR/requirements.txt" << 'REQEOF'
-flask>=2.3.0,<3.0.0
-gunicorn>=21.0.0,<22.0.0
-REQEOF
+# Copy application files from repo to deployment location
+cp "$APP_DIR/app/app.py" "$APP_DIR/deployed_app.py"
+cp "$APP_DIR/app/malformed_server.py" "$APP_DIR/deployed_malformed_server.py"
+cp "$APP_DIR/app/rebind_dns_server.py" "$APP_DIR/deployed_rebind_dns_server.py"
+cp "$APP_DIR/app/requirements.txt" "$APP_DIR/deployed_requirements.txt"
 
 chown -R site7:site7 "$APP_DIR"
 
 # 5. Install Python dependencies
-echo "[5/14] Installing Python dependencies..."
-pip3 install -r "$APP_DIR/requirements.txt" --quiet >> "$LOG_FILE" 2>&1 || true
+echo "[5/12] Installing Python dependencies..."
+pip3 install -r "$APP_DIR/deployed_requirements.txt" --quiet >> "$LOG_FILE" 2>&1 || true
 
 # 6. Create systemd units
-echo "[6/14] Creating systemd service files..."
+echo "[6/12] Creating systemd service files..."
 cat > /etc/systemd/system/paleon-site7.service << 'SERVICEEOF'
 [Unit]
 Description=Paleon Site 7 - Hostile Test Target
 After=network.target
+
 [Service]
 Type=simple
 User=site7
 Group=site7
 WorkingDirectory=/opt/paleon-site7
-ExecStart=/usr/bin/python3 /opt/paleon-site7/app.py
+ExecStart=/usr/bin/python3 /opt/paleon-site7/deployed_app.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
 
-cat > /etc/systemd/system/site7-malformed.service << 'SERVICEEOF'
+cat > /etc/systemd/system/site7-malformed-server.service << 'SERVICEEOF'
 [Unit]
 Description=Site 7 Malformed Response Server
 After=network.target paleon-site7.service
+
 [Service]
 Type=simple
 User=site7
 Group=site7
 WorkingDirectory=/opt/paleon-site7
-ExecStart=/usr/bin/python3 /opt/paleon-site7/malformed_server.py
+ExecStart=/usr/bin/python3 /opt/paleon-site7/deployed_malformed_server.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
@@ -442,16 +109,18 @@ cat > /etc/systemd/system/site7-rebind-dns.service << 'SERVICEEOF'
 [Unit]
 Description=Site 7 DNS Rebinding Simulator
 After=network.target
+
 [Service]
 Type=simple
 User=site7
 Group=site7
 WorkingDirectory=/opt/paleon-site7
-ExecStart=/usr/bin/python3 /opt/paleon-site7/rebind_dns.py
+ExecStart=/usr/bin/python3 /opt/paleon-site7/deployed_rebind_dns_server.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
@@ -459,27 +128,61 @@ SERVICEEOF
 systemctl daemon-reload
 
 # 7. Configure Nginx
-echo "[7/14] Configuring Nginx..."
-cat > /etc/nginx/sites-available/site7.conf << 'NGINXEOF'
+echo "[7/12] Configuring Nginx..."
+cat > /etc/nginx/sites-available/site7.conf << NGINXEOF
 server {
     listen 80;
     server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+
+    # Malformed endpoints - proxy to raw TCP server on port 9999
+    location /hostile/malformed/chunked {
+        proxy_pass http://127.0.0.1:9999/malformed/chunked;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300;
+        proxy_connect_timeout 300;
+    }
+
+    location /hostile/malformed/banner {
+        proxy_pass http://127.0.0.1:9999/malformed/banner;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300;
+        proxy_connect_timeout 300;
+    }
+
+    location /hostile/malformed/tls {
+        # TLS malformed requires separate TLS listener - not proxied
+        proxy_pass http://127.0.0.1:5000/hostile/malformed/tls;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300;
+        proxy_connect_timeout 300;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 300;
         proxy_connect_timeout 300;
     }
 }
 NGINXEOF
 
-cat > /etc/nginx/sites-available/offscope.conf << 'NGINXEOF'
+cat > /etc/nginx/sites-available/offscope.conf << NGINXEOF
 server {
     listen 80;
     server_name offscope.$DOMAIN_NAME;
+
     location / {
         return 200 "Off-scope target - no content served here\n";
         add_header Content-Type text/plain;
@@ -492,26 +195,29 @@ ln -sf /etc/nginx/sites-available/offscope.conf /etc/nginx/sites-enabled/offscop
 rm -f /etc/nginx/sites-enabled/default
 
 # 8. Start application services
-echo "[8/14] Starting application services..."
+echo "[8/12] Starting application services..."
 systemctl daemon-reload
 systemctl stop paleon-site7.service 2>/dev/null || true
-systemctl stop site7-malformed.service 2>/dev/null || true
+systemctl stop site7-malformed-server.service 2>/dev/null || true
 systemctl stop site7-rebind-dns.service 2>/dev/null || true
 systemctl start site7-rebind-dns.service 2>/dev/null || true
-systemctl start site7-malformed.service 2>/dev/null || true
+systemctl start site7-malformed-server.service 2>/dev/null || true
 systemctl start paleon-site7.service 2>/dev/null || true
 
 # 9. Start Nginx
-echo "[9/14] Starting Nginx..."
+echo "[9/12] Starting Nginx..."
 systemctl stop nginx 2>/dev/null || true
 systemctl start nginx
 
 # Wait for services to stabilize
 sleep 2
 
-# 10. Validate local HTTP
-echo "[10/14] Validating local HTTP..."
-if curl -s http://localhost:5000/ 2>/dev/null | head -1 | grep -q "HTTP/"; then
+# 10. Validate services
+echo "[10/12] Validating services..."
+ERRORS=0
+
+# Check Flask app
+if curl -s --max-time 5 http://localhost:5000/ >/dev/null 2>&1; then
     echo "[PASS] Flask app responding on port 5000"
 else
     echo "[WARN] Flask app not responding on port 5000, attempting restart..."
@@ -519,46 +225,57 @@ else
     sleep 3
 fi
 
-if curl -s http://localhost/ 2>/dev/null | head -1 | grep -q "HTTP/"; then
+# Check Nginx
+if curl -s --max-time 5 http://localhost/ >/dev/null 2>&1; then
     echo "[PASS] Nginx responding on port 80"
 else
     echo "[WARN] Nginx not responding, checking configuration..."
     nginx -t 2>&1 || true
 fi
 
-# 11. Configure hostile-test services
-echo "[11/14] Configuring hostile-test services..."
-mkdir -p "$DATA_DIR/observations"
-chmod 755 "$DATA_DIR/observations"
-if [ ! -f "$DATA_DIR/rebind-state.json" ]; then
-    echo '{"query_count":0,"state":"public"}' > "$DATA_DIR/rebind-state.json"
-    chown site7:site7 "$DATA_DIR/rebind-state.json"
+# Check malformed server (should be on port 9999)
+if ss -tlnp | grep -q ":9999 "; then
+    echo "[PASS] Malformed server listening on port 9999"
+else
+    echo "[WARN] Malformed server not listening on port 9999"
 fi
 
-# 12. Validate all endpoints
-echo "[12/14] Validating all endpoints..."
-ERRORS=0
+# Check DNS server (should be on port 53)
+if ss -ulnp | grep -q ":53 "; then
+    echo "[PASS] DNS rebinding server listening on UDP port 53"
+else
+    echo "[WARN] DNS rebinding server not listening on UDP port 53"
+fi
+
+# 11. Validate all endpoints
+echo "[11/12] Validating all endpoints..."
 ENDPOINTS=(
     "/"
     "/hostile/ssrf/fargate"
+    "/hostile/ssrf/fargate-relative"
     "/hostile/ssrf/imds"
     "/hostile/ssrf/rfc1918"
     "/hostile/ssrf/localhost"
     "/hostile/ssrf/ipv6-loopback"
     "/hostile/ssrf/ipv6-private"
     "/hostile/scope-escape"
-    "/hostile/redirect-loop"
+    "/hostile/redirect-loop/a"
+    "/hostile/redirect-loop/b"
+    "/hostile/redirect-loop/c"
+    "/hostile/self-loop"
     "/hostile/large-body"
     "/hostile/slow-body"
     "/hostile/gzip-bomb"
     "/hostile/malformed/chunked"
+    "/hostile/malformed/tls"
     "/hostile/malformed/banner"
+    "/hostile/rebind"
     "/hostile/read-only"
     "/hostile/kill-test"
     "/internal/site7-observation"
 )
 for ep in "${ENDPOINTS[@]}"; do
-    if curl -s -I --max-time 5 "http://localhost:5000$ep" 2>/dev/null | head -1 | grep -q "HTTP/"; then
+    if curl -s -I --max-time 5 "http://localhost$ep" 2>/dev/null | head -1 | grep -q "HTTP/"; then
         echo "[PASS] Endpoint $ep responding"
     else
         echo "[FAIL] Endpoint $ep not responding"
@@ -566,28 +283,28 @@ for ep in "${ENDPOINTS[@]}"; do
     fi
 done
 
-# 13. Enable HTTPS with certbot (if DNS is configured)
-echo "[13/14] Attempting HTTPS setup..."
-if host $DOMAIN_NAME >/dev/null 2>&1; then
+# 12. Enable HTTPS with certbot (if DNS is configured)
+echo "[12/12] Attempting HTTPS setup..."
+if host "$DOMAIN_NAME" >/dev/null 2>&1; then
     echo "DNS is configured, attempting certbot..."
-    certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME --non-interactive --agree-tos --email admin@$DOMAIN_NAME 2>/dev/null || {
+    certbot --nginx -d "$DOMAIN_NAME" -d "www.$DOMAIN_NAME" --non-interactive --agree-tos --email "admin@$DOMAIN_NAME" 2>/dev/null || {
         echo "[WARN] Certbot failed - DNS may not be pointed to this server"
     }
 else
     echo "[SKIP] DNS not configured for $DOMAIN_NAME"
 fi
 
-# 14. Final status
-echo "[14/14] Final status check..."
+# Final status
 echo
 echo "=== SERVICE STATUS ==="
 systemctl is-active paleon-site7.service 2>/dev/null || echo "paleon-site7: inactive"
-systemctl is-active site7-malformed.service 2>/dev/null || echo "site7-malformed: inactive"
+systemctl is-active site7-malformed-server.service 2>/dev/null || echo "site7-malformed-server: inactive"
 systemctl is-active site7-rebind-dns.service 2>/dev/null || echo "site7-rebind-dns: inactive"
 systemctl is-active nginx 2>/dev/null || echo "nginx: inactive"
 echo
 echo "=== LISTENING PORTS ==="
-ss -tlnp 2>/dev/null | grep -E ":(5000|5001|5002|8053|80|443) " || echo "No expected ports listening"
+ss -tlnp 2>/dev/null | grep -E ":(5000|9999|80|443) " || echo "No expected ports listening"
+ss -ulnp 2>/dev/null | grep -E ":53 " || echo "No expected UDP ports listening"
 echo
 echo "=== BOOTSTRAP COMPLETE ==="
 echo "Finished at $(date)"

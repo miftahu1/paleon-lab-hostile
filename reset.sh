@@ -9,7 +9,7 @@ echo "Stopping Site 7 services..."
 
 # Stop only Site 7 services
 systemctl stop paleon-site7.service 2>/dev/null || true
-systemctl stop site7-malformed.service 2>/dev/null || true
+systemctl stop site7-malformed-server.service 2>/dev/null || true
 systemctl stop site7-rebind-dns.service 2>/dev/null || true
 
 # Clear only Site 7 generated state
@@ -36,7 +36,7 @@ fi
 # Restart services
 echo "Starting Site 7 services..."
 systemctl start site7-rebind-dns.service 2>/dev/null || true
-systemctl start site7-malformed.service 2>/dev/null || true
+systemctl start site7-malformed-server.service 2>/dev/null || true
 systemctl start paleon-site7.service 2>/dev/null || true
 
 echo "=== RESET COMPLETE ==="

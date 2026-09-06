@@ -1,2 +1,4 @@
-flask>=2.3.0,<3.0.0
-gunicorn>=21.0.0,<22.0.0
+# PALEON SITE 7 — Python Dependencies
+# Single authoritative dependency file - synchronized with app/requirements.txt
+flask>=2.3.0,<4.0.0
+gunicorn>=21.0.0,<23.0.0

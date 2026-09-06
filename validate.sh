@@ -168,7 +168,6 @@ SH_SCRIPTS=(
     "reset.sh"
     "validate.sh"
     "verify.sh"
-    "user_data.sh"
 )
 
 for sh in "${SH_SCRIPTS[@]}"; do
