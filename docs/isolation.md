@@ -8,52 +8,66 @@ Site 7 implements a defense-in-depth isolation model to ensure the hostile test 
 
 ## 1. Network Architecture
 
-### AWS Deployment
+### AWS Deployment (Production)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        AWS REGION (us-east-1)                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   DEFAULT VPC                           │   │
-│  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │              SUBNET (public)                    │   │   │
-│  │  │  ┌──────────────────────────────────────────┐  │   │   │
-│  │  │  │          EC2 INSTANCE                    │  │   │   │
-│  │  │  │  - paleon-site7-instance                 │  │   │   │
-│  │  │  │  - NO IAM INSTANCE PROFILE               │  │   │   │
-│  │  │  │  - Security Group: paleon-site7-sg       │  │   │   │
-│  │  │  │  - Elastic IP attached                   │  │   │   │
-│  │  │  └──────────────────────────────────────────┘  │   │   │
-│  │  └─────────────────────────────────────────────────┘   │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   ROUTE 53                              │   │
-│  │  - paleon-lab-hostile.com        -> EIP                 │   │
-│  │  - offscope.paleon-lab-hostile.com -> EIP               │   │
-│  │  - rebind-test.paleon-lab-hostile.com -> 93.184.216.34  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                        AWS REGION (us-east-1)                 │
+│  ┌───────────────────────────────────────────────────────┐    │
+│  │                   DEFAULT VPC                         │    │
+│  │  ┌────────────────────────────────────────────────┐   │    │
+│  │  │              SUBNET (public)                   │   │    │
+│  │  │  ┌──────────────────────────────────────────┐  │   │    │
+│  │  │  │          EC2 INSTANCE                    │  │   │    │
+│  │  │  │  - paleon-site7-instance                 │  │   │    │
+│  │  │  │  - Ubuntu 24.04 LTS                      │  │   │    │
+│  │  │  │  - NO IAM INSTANCE PROFILE               │  │   │    │
+│  │  │  │  - Security Group: paleon-site7-sg       │  │   │    │
+│  │  │  │  - Elastic IP attached                   │  │   │    │
+│  │  │  └──────────────────────────────────────────┘  │   │    │
+│  │  └────────────────────────────────────────────────┘   │    │
+│  └───────────────────────────────────────────────────────┘    │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │                   ROUTE 53                              │  │
+│  │  - paleon-lab-hostile.com            -> EIP             │  │
+│  │  - offscope.paleon-lab-hostile.com   -> EIP             │  │
+│  │  - malformed-http.paleon-lab-hostile.com -> EIP         │  │
+│  │  - malformed-tls.paleon-lab-hostile.com -> EIP          │  │
+│  │  - ns1.paleon-lab-hostile.com        -> EIP (NS glue)   │  │
+│  │  - rebind-test.paleon-lab-hostile.com -> NS ns1...      │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-### Local/Docker Deployment
+### Local Development / Verification (single-instance, no container stack)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        DOCKER NETWORK                           │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
-│  │   Nginx      │ │  Flask App   │ │ Malformed    │            │
-│  │  :80/:443    │ │   :5000      │ │  Server :9999│            │
-│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘            │
-│         │                │                │                     │
-│         └────────────────┼────────────────┘                     │
-│                          ▼                                     │
-│                 ┌──────────────┐                              │
-│                 │ DNS Rebind   │                              │
-│                 │  Server:5353 │                              │
-│                 └──────────────┘                              │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                     SINGLE INSTANCE                          │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐  │
+│  │   Nginx      │ │  Flask App   │ │ Malformed TLS :9998  │  │
+│  │  :80/:443    │ │  :5000       │ │ (127.0.0.1 only)     │  │
+│  └──────┬───────┘ └──────┬───────┘ └──────────────────────┘  │
+│         │                │                                    │
+│         │          ┌─────┴─────┐                              │
+│         │          ▼           ▼                              │
+│         │  ┌────────────┐ ┌────────────┐                      │
+│         │  │ :8443      │ │ Malformed  │                      │
+│         │  │ (internal  │ │ HTTP :9999 │                      │
+│         │  │  TLS term) │ │ (127.0.0.1)│                      │
+│         │  └────────────┘ └────────────┘                      │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌──────────────┐                                            │
+│  │ DNS Rebind   │                                            │
+│  │ Server :53   │                                            │
+│  │ (0.0.0.0)    │                                            │
+│  └──────────────┘                                            │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+**Note**: There is no container stack. Site 7 is a single Ubuntu 24.04 EC2 instance running three Python services under systemd behind Nginx.
 
 ---
 
@@ -63,20 +77,30 @@ Site 7 implements a defense-in-depth isolation model to ensure the hostile test 
 
 | Port | Protocol | Source | Purpose |
 |------|----------|--------|---------|
-| 80 | TCP | 0.0.0.0/0 | HTTP test endpoints |
-| 443 | TCP | 0.0.0.0/0 | HTTPS test endpoints |
+| 80 | TCP | 0.0.0.0/0 | HTTP test endpoints (redirects to 443) |
+| 443 | TCP | 0.0.0.0/0 | HTTPS test endpoints (SNI routing) |
+| 53 | TCP | 0.0.0.0/0 | DNS rebinding test entry |
+| 53 | UDP | 0.0.0.0/0 | DNS rebinding test entry |
 | 22 | TCP | `admin_ip` (variable) | SSH admin access only |
 
 ### Egress Rules
 
-| Port | Protocol | Destination | Purpose |
-|------|----------|-------------|---------|
-| All | All | 0.0.0.0/0 | AWS default (required for package updates, dependency downloads during bootstrap) |
+**Security-group egress** is left at the AWS default (all outbound allowed). This is required so the bootstrap can `apt-get install` and `pip install` from public mirrors.
 
-**Note**: No explicit egress restrictions are applied. The default AWS security group allows all outbound. This is intentional because:
-1. Bootstrap needs `yum/dnf install` and `pip install`
-2. The application itself makes **zero outbound calls** (enforced in code)
-3. Adding explicit egress deny would break bootstrap
+| Layer | Rule | Purpose |
+|-------|------|---------|
+| Security group | All outbound allowed (AWS default) | Bootstrap package / dependency downloads |
+| Host firewall (`site7` uid) | `REJECT` to RFC1918, link-local, IPv6 ULA/link-local | Application-user egress isolation |
+
+**Host-level egress isolation.** The SG stays open, but the unprivileged `site7` service user is confined at the host level. `site7-egress-firewall.service` — a `systemd` oneshot ordered `Before=network-pre.target` — installs `iptables`/`ip6tables` `owner --uid-owner site7` rules that `REJECT` traffic originating from the `site7` user to:
+
+- `169.254.0.0/16` (link-local / cloud metadata)
+- `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC1918)
+- `fc00::/7`, `fe80::/10` (IPv6 ULA / link-local)
+
+Because the rules are installed by an **enabled** `systemd` unit ordered before networking, they are reinstalled on every boot — the isolation **persists across reboot** rather than living only in the running kernel. Root and other system users keep the outbound access that bootstrap and package updates need; only the application user is confined.
+
+This is defense in depth: the application code also makes **zero outbound calls** (enforced in code and checked by `validate.sh`). Even if that code changed, the host firewall would still block the `site7` user from reaching metadata and private ranges.
 
 ---
 
@@ -119,12 +143,14 @@ grep -r "wget" app/
 
 | Service | Port | Bind Address | Exposure |
 |---------|------|--------------|----------|
-| Flask App | 5000 | 0.0.0.0 (behind Nginx) | Via Nginx 80/443 |
-| Nginx | 80/443 | 0.0.0.0 | Public |
-| Malformed Server | 9999 | 127.0.0.1 | Localhost only |
-| DNS Rebind Server | 5353 (UDP) | 127.0.0.1 | Localhost only |
+| Flask App | 5000 | 127.0.0.1 | Internal only (via Nginx 8443) |
+| Nginx Internal TLS | 8443 | 127.0.0.1 | Internal only (default SNI backend) |
+| Malformed TLS Server | 9998 | 127.0.0.1 | Internal only (via SNI on 443) |
+| Malformed HTTP Server | 9999 | 127.0.0.1 | Internal only (via SNI on 443) |
+| DNS Rebinding Server | 53 | 0.0.0.0 | **Public** (authoritative DNS for rebind-test) |
+| Nginx Public | 80, 443 | 0.0.0.0 | **Public** (scanner entry points) |
 
-The malformed protocol server and DNS rebind server **only bind to 127.0.0.1**. They are not accessible from the network.
+The malformed protocol servers and Flask app **only bind to 127.0.0.1**. They are not accessible from the network directly — all traffic goes through Nginx on ports 80/443 with SNI routing.
 
 ### No Secrets or Credentials
 
@@ -153,8 +179,8 @@ The malformed protocol server and DNS rebind server **only bind to 127.0.0.1**. 
 - No database credentials
 - No service mesh tokens
 
-### 3. Security Group Blocks Internal Access (Implicit)
-While the SG allows all outbound by default, the **application code itself prevents outbound calls**. Even if the SG allowed it, the Flask app has no `requests`, `httpx`, `urllib`, or socket connection code.
+### 3. Host Firewall Blocks the Application User
+The SG allows all outbound by default, but the `site7` user is confined by host `iptables`/`ip6tables` `owner --uid-owner` rules that `REJECT` RFC1918, link-local, and IPv6 ULA/link-local destinations (see §2), reinstalled on every boot. Defense in depth: the application code also contains no `requests`, `httpx`, `urllib`, or socket-connect code, so it makes no outbound calls even where the firewall would allow them.
 
 ### 4. Metadata Service Access is Impossible
 - IMDS (169.254.169.254) is accessible from any EC2 instance
@@ -175,10 +201,11 @@ While the SG allows all outbound by default, the **application code itself preve
 
 | Layer | Isolation Mechanism |
 |-------|---------------------|
-| **Network** | Dedicated VPC (default), no peering, no transit gateway |
-| **Security Group** | Minimal ingress (80/443 public, 22 admin only), default egress |
+| **Network** | Default VPC, no peering, no transit gateway, no VPN |
+| **Security Group** | Minimal ingress (80/443/53 public, 22 admin only); default (open) egress for bootstrap |
+| **Host Firewall** | `site7` uid `REJECT` to RFC1918 / link-local / IPv6 ULA — reboot-persistent via systemd oneshot |
 | **IAM** | No instance profile — zero AWS permissions |
-| **Application** | No outbound network code; localhost-only internal servers |
+| **Application** | No outbound network code; 127.0.0.1-only internal servers |
 | **DNS** | Lab-controlled zone; rebind test uses separate controlled hostname |
 | **Runtime** | No secrets, no credentials, no external dependencies |
 | **Process** | Separate processes for malformed/DNS tests; no shared state |
@@ -201,19 +228,27 @@ While the SG allows all outbound by default, the **application code itself preve
 
 ### Runtime Verification
 ```bash
-# From the instance itself:
-# 1. Verify no IAM role
-curl http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>&1 | head -1
-# Should return 404 or empty
+# 1. Verify no IAM role (from the AWS control plane, not from the instance):
+aws ec2 describe-instances --instance-ids <id> \
+  --query 'Reservations[].Instances[].IamInstanceProfile' --output text
+# Should print "None" — no instance profile is attached.
+# (IMDSv2 is required, so a token-less request to 169.254.169.254 returns 401, never credentials.)
+
+# The remaining checks run on the instance itself:
 
 # 2. Verify application makes no outbound calls
 # (Check process network connections)
-ss -tulpn | grep -E ":5000|:9999|:5353"
+ss -tulpn | grep -E ":5000|:8443|:9998|:9999|:53"
 # Should show only listening sockets, no ESTABLISHED outbound
 
 # 3. Verify localhost-only binding for internal servers
 ss -tulpn | grep 127.0.0.1
-# Should show :9999 and :5353 bound to 127.0.0.1 only
+# Should show :5000, :8443, :9998, :9999 bound to 127.0.0.1 only
+# Should show :53 bound to 0.0.0.0 (public)
+
+# 4. Verify DNS rebinding is authoritative
+dig @localhost rebind-test.paleon-lab-hostile.com
+# Should return EIP (1st query) or 192.168.1.1 (subsequent)
 ```
 
 ---
@@ -228,6 +263,8 @@ ss -tulpn | grep 127.0.0.1
 | Application updated to add outbound calls | Code review; validate.sh checks for outbound patterns |
 | DNS zone shared with production | Dedicated hosted zone or explicit subdomain delegation |
 | Credentials leaked via user_data | user_data.sh references no secrets; uses only public packages |
+| Internal services exposed externally | All internal servers bind to 127.0.0.1; only Nginx/DNS on 0.0.0.0 |
+| IMDS access by application | App reads PUBLIC_IP from SITE7_EIP env var, not IMDS |
 
 ---
 
@@ -239,5 +276,6 @@ The isolation model is **defense in depth**:
 3. **Application**: No outbound code = cannot initiate connections
 4. **Runtime**: No secrets = nothing to steal
 5. **Operational**: Dedicated resources = no noisy neighbor risk
+6. **Binding**: Internal services on 127.0.0.1 only
 
 Even if one layer fails, the others provide protection. The application code itself is the strongest barrier — it simply cannot make outbound connections by design.

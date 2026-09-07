@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/var/log/paleon-site7-bootstrap.log
+
+# Terraform
+terraform.tfstate
+terraform.tfstate.*
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+!/etc/ssl/site7/*.crt
+!/etc/ssl/site7/*.key
+
+# Data directories
+/var/lib/site7/rebind-state.json
+
+# Nginx
+/var/log/nginx/*.log
+
+# Test outputs
+*.output
+*.tmp

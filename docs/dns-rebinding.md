@@ -12,35 +12,36 @@ This document describes the DNS rebinding test implementation for Site 7. The te
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      SCANNER (External)                              │
+│                      SCANNER (External)                             │
 └─────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      DNS RESOLUTION                                 │
-│                                                                      │
-│  First lookup:                                                       │
-│  rebind-test.paleon-lab-hostile.com  ->  93.184.216.34 (public)    │
-│                                                                      │
-│  Subsequent lookups (TTL=0 forces re-query):                         │
-│  rebind-test.paleon-lab-hostile.com  ->  192.168.1.1 (private)     │
+│                                                                     │
+│  First lookup (via recursive resolver):                             │
+│  rebind-test.paleon-lab-hostile.com  ->  <Site 7 EIP> (public)      │
+│                                                                     │
+│  Subsequent lookups (TTL=0 forces re-query):                        │
+│  rebind-test.paleon-lab-hostile.com  ->  192.168.1.1 (private)      │
 └─────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    DNS REBIND SERVER                                │
-│                                                                      │
-│  - Listens on 127.0.0.1:5353 (UDP)                                  │
-│  - Authoritative for rebind-test.paleon-lab-hostile.com            │
-│  - Tracks query count per session                                   │
-│  - Persists state to /var/lib/site7/rebind-state.json              │
+│                                                                     │
+│  - Listens on 0.0.0.0:53 (TCP & UDP)                                │
+│  - Authoritative for rebind-test.paleon-lab-hostile.com             │
+│  - Tracks query count (per client, keyed by IP)                     │
+│  - Persists state to /var/lib/site7/rebind-state.json               │
 │  - Reset capability: python rebind_dns_server.py reset              │
+│  - Runs as site7 user with CAP_NET_BIND_SERVICE                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Test Flow
 
-1. **Scanner resolves hostname** → Gets public IP (93.184.216.34)
+1. **Scanner resolves hostname** → Gets Site 7 EIP (public)
 2. **Scanner connects to public IP** → Reaches Site 7 Nginx
 3. **Scanner follows redirect or makes new connection** → Must re-resolve DNS
 4. **Second DNS query** → Gets private IP (192.168.1.1)
@@ -52,43 +53,59 @@ This document describes the DNS rebinding test implementation for Site 7. The te
 
 ### DNS Server (`app/rebind_dns_server.py`)
 
-**Protocol**: Raw UDP DNS (RFC 1035), no external dependencies
+**Protocol**: Raw UDP/TCP DNS (RFC 1035), no external dependencies
 
 **State Management**:
-- In-memory query counter
+- Per-client query counters, keyed by client IP (in-memory `OrderedDict`, LRU-evicted at `MAX_CLIENTS`)
 - Persisted to `/var/lib/site7/rebind-state.json`
 - Survives process restart
 - Reset via CLI argument: `python rebind_dns_server.py reset`
+- Per-client (not global): each client IP is tracked independently, so one client advancing to "private" never changes what a different, first-time client sees
 
 **Response Logic**:
 ```python
-def get_answer_ip(self):
+def get_answer_ip(self, client_ip):
     with self.lock:
-        if self.query_count == 0:
-            self.query_count += 1
-            self.save_state()
-            return "93.184.216.34"  # Public test IP (example.com)
-        else:
-            self.query_count += 1
-            if self.query_count > MAX_QUERIES:
-                self.reset()  # Safety: wrap around
-                return "93.184.216.34"
-            self.save_state()
-            return "192.168.1.1"  # Private IP
+        # LRU-evict the oldest client if at capacity and this IP is new
+        if client_ip not in self.client_counts and len(self.client_counts) >= MAX_CLIENTS:
+            self.client_counts.popitem(last=False)
+        count = self.client_counts.get(client_ip, 0)
+        # Query #1 (count == 0) -> public EIP (from SITE7_EIP).
+        # Every subsequent query -> private 192.168.1.1.
+        # The per-client counter is CAPPED at MAX_QUERIES_PER_CLIENT (100) and
+        # NEVER wraps, so query #101+ still returns the private address. A client
+        # is never handed the public IP again after its very first query.
+        answer = PUBLIC_IP if count == 0 else PRIVATE_IP
+        self.client_counts[client_ip] = min(count + 1, MAX_QUERIES_PER_CLIENT)
+        self.total_a_queries += 1
+        self.save_state()
+        return answer
 ```
 
 **TTL**: Always 0 — forces re-resolution on every query
 
+**Flags**: 
+- AA (Authoritative Answer) = 1 (0x8400)
+- RA (Recursion Available) = 0
+
+**Query Filtering**:
+- Only responds to QTYPE=1 (A records)
+- Only responds to queries containing `rebind-test.paleon-lab-hostile.com`
+
+**Concurrency**:
+- UDP: `ThreadPoolExecutor` (10 workers) gated by a non-blocking `BoundedSemaphore`; excess datagrams are dropped
+- TCP: `ThreadPoolExecutor` (10 workers) gated by a non-blocking `BoundedSemaphore`; excess connections are closed
+
 **Logging**: Structured JSON logs for each query:
 ```json
 {
-  "timestamp": "2026-09-04T...",
+  "timestamp": "2026-09-07T...",
   "level": "INFO",
   "message": "dns_query",
   "query_count": 1,
   "query_name": "rebind-test.paleon-lab-hostile.com",
-  "answer_ip": "93.184.216.34",
-  "client_ip": "127.0.0.1"
+  "answer_ip": "<EIP>",
+  "client_ip": "192.0.2.1"
 }
 ```
 
@@ -105,19 +122,32 @@ paleon-lab-hostile.com.        300  IN  A  <EIP>
 # Off-scope domain - same EIP, different hostname
 offscope.paleon-lab-hostile.com.  300  IN  A  <EIP>
 
-# Rebinding test - initially points to public test IP
-rebind-test.paleon-lab-hostile.com.  60  IN  A  93.184.216.34
+# Malformed HTTP subdomain
+malformed-http.paleon-lab-hostile.com.  300  IN  A  <EIP>
+
+# Malformed TLS subdomain
+malformed-tls.paleon-lab-hostile.com.  300  IN  A  <EIP>
+
+# NS glue record - ns1 hostname resolves to Site 7 EIP
+ns1.paleon-lab-hostile.com.      300  IN  A  <EIP>
+
+# NS delegation: rebind-test subdomain delegated to ns1
+rebind-test.paleon-lab-hostile.com.  300  IN  NS  ns1.paleon-lab-hostile.com.
 ```
 
-**Note**: The rebind test hostname in Route53 initially points to a public test IP (93.184.216.34). The actual rebinding behavior is implemented by the **local DNS server** on port 5353, not by Route53. Route53 provides the initial public resolution; the local server handles the rebinding sequence.
+**How It Works**:
+1. Route53 serves NS record for `rebind-test.paleon-lab-hostile.com` pointing to `ns1.paleon-lab-hostile.com`
+2. Resolver queries `ns1.paleon-lab-hostile.com` → gets EIP from A record
+3. Resolver queries Site 7 instance on port 53 (TCP/UDP) for `rebind-test.paleon-lab-hostile.com`
+4. Site 7 DNS server responds with EIP (1st query) or 192.168.1.1 (subsequent)
 
-### Why This Design?
-
+**Why This Design?**
 - **Deterministic**: No timing races, no third-party DNS
 - **Controlled**: Lab owns all DNS infrastructure
-- **Isolated**: Local DNS server on 127.0.0.1:5353
+- **Authoritative**: Site 7 is the authoritative nameserver for rebind-test
 - **Resettable**: Single command restores initial state
 - **Observable**: Every query logged with sequence number
+- **Standard ports**: Uses standard DNS port 53 (TCP/UDP)
 
 ---
 
@@ -125,38 +155,36 @@ rebind-test.paleon-lab-hostile.com.  60  IN  A  93.184.216.34
 
 ### For Scanner Testing
 
-The scanner should be configured to use the Site 7 DNS server for the rebind test hostname, OR the test should be run in an environment where `rebind-test.paleon-lab-hostile.com` resolves via the local DNS server.
-
-**Option 1: Scanner uses Site 7 as DNS resolver**
-- Configure scanner DNS to include 127.0.0.1:5353 (requires network access to Site 7 instance)
-
-**Option 2: Hosts file / local resolver override**
-- During test, override resolution for rebind-test hostname to use local DNS server
-
-**Option 3: Direct DNS queries to test server**
-- Scanner makes DNS queries directly to 127.0.0.1:5353 for rebind-test hostname
+The scanner resolves `rebind-test.paleon-lab-hostile.com` through standard recursive DNS resolution. The NS delegation in Route53 directs queries to the Site 7 instance on port 53.
 
 ### Manual Verification
 
 ```bash
-# First query - should return public IP
-dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com +short
-# Expected: 93.184.216.34
+# First query - should return public EIP
+dig rebind-test.paleon-lab-hostile.com +short
+# Expected: <Site 7 EIP>
 
 # Second query - should return private IP
-dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com +short
+dig rebind-test.paleon-lab-hostile.com +short
 # Expected: 192.168.1.1
 
 # Third query - still private (until reset)
-dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com +short
+dig rebind-test.paleon-lab-hostile.com +short
 # Expected: 192.168.1.1
 
+# Direct authoritative query (bypass recursive resolver)
+dig @<EIP> rebind-test.paleon-lab-hostile.com +short
+# Expected: <EIP> (1st), then 192.168.1.1 (2nd)
+
 # Reset state
-python app/rebind_dns_server.py reset
+python /opt/paleon-site7/deployed_rebind_dns_server.py reset
+
+# Or via reset.sh (which calls this):
+./reset.sh
 
 # After reset - back to public
-dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com +short
-# Expected: 93.184.216.34
+dig rebind-test.paleon-lab-hostile.com +short
+# Expected: <Site 7 EIP>
 ```
 
 ---
@@ -167,7 +195,7 @@ dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com +short
 
 The scanner **must**:
 1. ✅ Resolve `rebind-test.paleon-lab-hostile.com` initially
-2. ✅ Connect to the resolved address (public IP)
+2. ✅ Connect to the resolved address (public EIP)
 3. ✅ On subsequent connection attempt, **re-resolve DNS** (not use cached IP)
 4. ✅ Detect that the new resolution returns a private IP (192.168.1.1)
 5. ✅ **Refuse to connect** to the private address
@@ -205,7 +233,7 @@ The scanner **must not**:
 
 ```bash
 # On the Site 7 instance:
-python app/rebind_dns_server.py reset
+python /opt/paleon-site7/deployed_rebind_dns_server.py reset
 
 # Or via reset.sh (which calls this):
 ./reset.sh
@@ -225,15 +253,16 @@ The reset script:
 
 - ❌ No actual connection to 192.168.1.1 (private IP is never reachable)
 - ❌ No network scanning or probing of internal networks
-- ❌ No modification of production DNS
+- ❌ No modification of production DNS beyond Route53 records
 - ❌ No real rebinding attack against real infrastructure
 
 ### Why It's Safe
 
 1. **Private IP is documentation-only** (192.168.1.1) — not a real internal service
-2. **Localhost-only DNS server** — not exposed to network
+2. **Authoritative DNS on standard port 53** — standard protocol, no exotic listeners
 3. **Deterministic behavior** — no races, no external dependencies
 4. **Explicit reset** — state never persists beyond test intent
+5. **No IMDS usage** — public IP provided via Terraform/user_data environment variable
 
 ---
 
@@ -254,8 +283,10 @@ The reset script:
 
 | Issue | Resolution |
 |-------|------------|
-| DNS server not starting | Check port 5353 not in use: `ss -ulpn | grep 5353` |
-| Queries not logged | Check `/var/log/` and stdout for JSON logs |
+| DNS server not starting | Check port 53 not in use: `ss -tulpn | grep :53` |
+| Queries not logged | Check journalctl: `journalctl -u site7-rebind-dns -f` |
 | State not persisting | Verify `/var/lib/site7/` is writable by site7 user |
-| Always returns public IP | Run reset: `python rebind_dns_server.py reset` |
-| Route53 record wrong | Verify in AWS console: `aws route53 list-resource-record-sets` |
+| Always returns public IP | Run reset: `python /opt/paleon-site7/deployed_rebind_dns_server.py reset` |
+| Route53 record wrong | Verify in AWS console: `aws route53 list-resource-record-sets --zone-id <ZONE>` |
+| CAP_NET_BIND_SERVICE missing | Check systemd unit: `systemctl show site7-rebind-dns --property=AmbientCapabilities` |
+| SITE7_EIP not set | Verify user_data template passes `${public_ip}` and service has Environment=SITE7_EIP |

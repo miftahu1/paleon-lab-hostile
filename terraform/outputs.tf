@@ -46,6 +46,8 @@ output "hostnames" {
   value = [
     var.hostname,
     var.offscope_hostname,
+    "malformed-http.${var.hostname}",
+    "malformed-tls.${var.hostname}",
     var.rebind_hostname,
   ]
 }
@@ -56,7 +58,7 @@ output "hostnames" {
 
 output "deployment_summary" {
   description = "Human-readable summary of the Site 7 deployment."
-  value = <<-EOT
+  value       = <<-EOT
 
     ============================================================
      PALEON TEST SITE 7 - Deployment Summary
@@ -68,11 +70,13 @@ output "deployment_summary" {
      Security Group: ${aws_security_group.paleon-site7-sg.id}
     ------------------------------------------------------------
      Hostnames :
-       Primary   : ${var.hostname}          -> ${aws_eip.paleon-site7-eip.public_ip}
-       Off-scope : ${var.offscope_hostname}  -> ${aws_eip.paleon-site7-eip.public_ip}
-       Rebind    : ${var.rebind_hostname}    -> 93.184.216.34 (initial)
+       Primary      : ${var.hostname}          -> ${aws_eip.paleon-site7-eip.public_ip}
+       Off-scope    : ${var.offscope_hostname}  -> ${aws_eip.paleon-site7-eip.public_ip}
+       Malformed HTTP : malformed-http.${var.hostname} -> ${aws_eip.paleon-site7-eip.public_ip}
+       Malformed TLS  : malformed-tls.${var.hostname} -> ${aws_eip.paleon-site7-eip.public_ip}
+       Rebind       : ${var.rebind_hostname}    -> NS ns1.${var.hostname}
     ============================================================
-     SSH: ssh -i <key>.pem ec2-user@${aws_eip.paleon-site7-eip.public_ip}
+     SSH: ssh -i <key>.pem ubuntu@${aws_eip.paleon-site7-eip.public_ip}
     ============================================================
   EOT
 }

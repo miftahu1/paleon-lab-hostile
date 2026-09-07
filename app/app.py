@@ -7,11 +7,12 @@ Provides endpoints to test SSRF, DNS rebinding, redirect loops, resource exhaust
 malformed responses, and scope escape attempts.
 
 Security constraints:
-- No outbound network calls
-- No database, no authentication, no sessions
-- Resource limits enforced (MAX_BODY_SIZE=50MB, MAX_DELAY=30000ms)
-- Structured JSON logging without credentials/secrets
-- Streaming responses to avoid RAM allocation
+    - No outbound network calls
+    - No database, no authentication, no sessions
+    - Resource limits enforced (MAX_BODY_SIZE=20MB, MAX_DELAY=15000ms,
+      kill-test hold=15s, gzip decompressed output=10MB)
+    - Structured JSON logging without credentials/secrets
+    - Streaming responses to avoid allocating entire hostile payloads in RAM
 """
 
 import os
@@ -20,8 +21,7 @@ import json
 import time
 import logging
 import threading
-import gzip
-import io
+import zlib
 from functools import wraps
 from datetime import datetime, timezone
 from typing import Generator, Optional
@@ -31,11 +31,15 @@ from flask import Flask, request, Response, redirect, jsonify, stream_with_conte
 # ============================================================================
 # Configuration Constants
 # ============================================================================
-MAX_BODY_SIZE = 20 * 1024 * 1024  # 20 MB (default 10MB, max 20MB)
-MAX_DELAY = 30000  # 30 seconds
+MAX_BODY_SIZE = 20 * 1024 * 1024  # 20 MB absolute maximum
+MAX_DELAY = 15000  # 15 seconds
+MAX_KILL_HOLD = 15  # seconds
+MAX_GZIP_DECOMPRESSED = 10 * 1024 * 1024  # 10 MB
 MAIN_PORT = 5000
-MALFORMED_PORT = 9999
-DNS_PORT = 53
+SENSITIVE_HEADER_KEYS = (
+    'cookie', 'authorization', 'password', 'secret', 'token',
+    'api_key', 'apikey', 'api-key', 'x-api-key', 'credential', 'credentials',
+)
 
 # ============================================================================
 # Structured Logging Setup
@@ -59,8 +63,7 @@ class JSONFormatter(logging.Formatter):
                            'processName', 'relativeCreated', 'thread', 'threadName',
                            'exc_info', 'exc_text', 'stack_info'):
                 # Filter out sensitive fields
-                if key.lower() not in ('cookie', 'authorization', 'password', 'secret',
-                                       'token', 'api_key', 'apikey', 'credential'):
+                if key.lower() not in SENSITIVE_HEADER_KEYS:
                     log_entry[key] = value
 
         return json.dumps(log_entry)
@@ -76,12 +79,14 @@ logger.addHandler(handler)
 # ============================================================================
 # Observations Storage (in-memory, thread-safe)
 # ============================================================================
+from collections import deque
+
 class ObservationStore:
     """Thread-safe in-memory storage for endpoint observations."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._observations = []
+        self._observations = deque(maxlen=100)
 
     def add(self, observation: dict):
         with self._lock:
@@ -130,7 +135,7 @@ def log_observation(test_id: str, method: str, path: str, headers: dict, **extra
         "method": method,
         "path": path,
         "headers": {k: v for k, v in headers.items()
-                    if k.lower() not in ('cookie', 'authorization', 'password', 'secret', 'token')},
+                    if k.lower() not in SENSITIVE_HEADER_KEYS},
         **extra
     }
     observation_store.add(obs)
@@ -171,29 +176,30 @@ def generate_slow_body(delay_ms: int, chunks: int = 10) -> Generator[bytes, None
         time.sleep(delay_per_chunk)
 
 
-def generate_gzip_bomb_stream(decompressed_size: int = 10 * 1024 * 1024, chunk_size: int = 1024 * 1024) -> Generator[bytes, None, None]:
-    """Stream a gzip-compressed payload that decompresses to ~10MB without allocating full payload in RAM."""
-    # Create a gzip stream that writes repetitive data (zeros) in chunks
-    # This avoids allocating the full decompressed payload in memory
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=9) as gz:
-        # Write zero bytes in chunks to the gzip stream
-        for i in range(0, decompressed_size, chunk_size):
-            write_size = min(chunk_size, decompressed_size - i)
-            gz.write(b"\x00" * write_size)
-            # Yield whatever has been compressed so far
-            pos = buf.tell()
-            if pos > 0:
-                buf.seek(0)
-                yield buf.read(pos)
-                buf.seek(0)
-                buf.truncate(0)
+def generate_gzip_bomb_stream(
+    decompressed_size: int = MAX_GZIP_DECOMPRESSED,
+    input_chunk: int = 64 * 1024,
+) -> Generator[bytes, None, None]:
+    """Stream a valid gzip payload that decompresses to decompressed_size.
 
-    # Flush any remaining compressed data
-    pos = buf.tell()
-    if pos > 0:
-        buf.seek(0)
-        yield buf.read(pos)
+    Uses zlib.compressobj(wbits=31) so output is a real gzip member. Input is
+    generated in small zero-chunks; the full 10MB decompressed buffer is never
+    held in RAM. Compressed output is yielded as the compressor produces it.
+    """
+    size = min(decompressed_size, MAX_GZIP_DECOMPRESSED)
+    compressor = zlib.compressobj(level=9, wbits=31)
+    remaining = size
+    zeros = b"\x00" * input_chunk
+    while remaining > 0:
+        n = min(input_chunk, remaining)
+        block = zeros if n == input_chunk else b"\x00" * n
+        out = compressor.compress(block)
+        remaining -= n
+        if out:
+            yield out
+    tail = compressor.flush()
+    if tail:
+        yield tail
 
 
 # ============================================================================
@@ -303,23 +309,23 @@ def landing():
                 <a href="/hostile/slow-body">Slow Body</a>
                 <span class="category">Delayed streaming response</span>
                 <div class="endpoints">
-                    <div class="endpoint">GET /hostile/slow-body?delay_ms=5000 (default 5000, max 30000)</div>
+                    <div class="endpoint">GET /hostile/slow-body?delay_ms=5000 (default 5000, max 15000)</div>
                 </div>
             </li>
             <li>
                 <a href="/hostile/gzip-bomb">Gzip Bomb</a>
-                <span class="category">~20KB compressed → ~10MB decompressed</span>
+                <span class="category">~10KB compressed → ~10MB decompressed</span>
                 <div class="endpoints">
                     <div class="endpoint">GET /hostile/gzip-bomb</div>
                 </div>
             </li>
             <li>
-                <a href="/hostile/malformed">Malformed Responses</a>
-                <span class="category">Invalid HTTP responses</span>
+                <a href="/hostile/malformed">Malformed Responses (via SNI routing)</a>
+                <span class="category">Invalid HTTP/TLS responses on dedicated subdomains</span>
                 <div class="endpoints">
-                    <div class="endpoint">GET /hostile/malformed/chunked — Invalid chunked encoding</div>
-                    <div class="endpoint">GET /hostile/malformed/tls — Placeholder (separate listener)</div>
-                    <div class="endpoint">GET /hostile/malformed/banner — Junk HTTP banner</div>
+                    <div class="endpoint">GET https://malformed-http.paleon-lab-hostile.com/malformed/chunked — Invalid chunked encoding</div>
+                    <div class="endpoint">GET https://malformed-http.paleon-lab-hostile.com/malformed/banner — Junk HTTP banner</div>
+                    <div class="endpoint">GET https://malformed-tls.paleon-lab-hostile.com/ — Garbled TLS ServerHello</div>
                 </div>
             </li>
             <li>
@@ -331,7 +337,7 @@ def landing():
             </li>
             <li>
                 <a href="/hostile/kill-test">Connection Hold</a>
-                <span class="category">Holds connection for 30s then closes</span>
+                <span class="category">Holds connection for 15s then closes</span>
                 <div class="endpoints">
                     <div class="endpoint">GET /hostile/kill-test</div>
                 </div>
@@ -361,7 +367,7 @@ def ssrf_fargate():
 
 @app.route('/hostile/ssrf/fargate-relative')
 def ssrf_fargate_relative():
-    """302 redirect to Fargate metadata endpoint with test-site7 path. SSRF-002"""
+    """302 redirect to Fargate metadata endpoint (relative-path variant). SSRF-001"""
     dest = "http://169.254.170.2/v2/credentials/test-site7"
     log_test_hit("ssrf_fargate_relative", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -369,7 +375,7 @@ def ssrf_fargate_relative():
 
 @app.route('/hostile/ssrf/imds')
 def ssrf_imds():
-    """302 redirect to EC2 IMDS endpoint. SSRF-003"""
+    """302 redirect to EC2 IMDS endpoint. SSRF-002"""
     dest = "http://169.254.169.254/latest/meta-data/"
     log_test_hit("ssrf_imds", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -377,7 +383,7 @@ def ssrf_imds():
 
 @app.route('/hostile/ssrf/rfc1918')
 def ssrf_rfc1918():
-    """302 redirect to RFC1918 address based on target parameter. SSRF-004"""
+    """302 redirect to RFC1918 address based on target parameter. SSRF-003"""
     target = request.args.get('target', '10')
 
     targets = {
@@ -394,7 +400,7 @@ def ssrf_rfc1918():
 
 @app.route('/hostile/ssrf/localhost')
 def ssrf_localhost():
-    """302 redirect to localhost. SAFE-001"""
+    """302 redirect to localhost. SSRF-004"""
     dest = "http://127.0.0.1/"
     log_test_hit("ssrf_localhost", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -402,7 +408,7 @@ def ssrf_localhost():
 
 @app.route('/hostile/ssrf/ipv6-loopback')
 def ssrf_ipv6_loopback():
-    """302 redirect to IPv6 loopback. SAFE-002"""
+    """302 redirect to IPv6 loopback. SSRF-004"""
     dest = "http://[::1]/"
     log_test_hit("ssrf_ipv6_loopback", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -410,7 +416,7 @@ def ssrf_ipv6_loopback():
 
 @app.route('/hostile/ssrf/ipv6-private')
 def ssrf_ipv6_private():
-    """302 redirect to IPv6 private (ULA) address. SAFE-003"""
+    """302 redirect to IPv6 private (ULA) address. SSRF-004"""
     dest = "http://[fd00::1]/"
     log_test_hit("ssrf_ipv6_private", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -453,19 +459,33 @@ def rebind():
 # ============================================================================
 @app.route('/hostile/scope-escape')
 def scope_escape():
-    """302 redirect to off-scope domain. SAFE-005"""
+    """302 redirect to off-scope domain. SAFE-001"""
     dest = "https://offscope.paleon-lab-hostile.com/landing"
     log_test_hit("scope_escape", request.method, request.path, 302,
                  redirect_dest=dest, off_scope=True)
     return redirect(dest, code=302)
 
 
+@app.route('/health')
+def health():
+    """Local process health for bootstrap/ops. Not a scanner resilience test."""
+    return jsonify({"status": "ok", "service": "paleon-site7"}), 200
+
+
 # ============================================================================
 # Redirect Loops
 # ============================================================================
+@app.route('/hostile/redirect-loop')
+def redirect_loop_entry():
+    """Start of the 3-cycle redirect loop. SAFE-002"""
+    dest = "/hostile/redirect-loop/a"
+    log_test_hit("redirect_loop", request.method, request.path, 302, redirect_dest=dest)
+    return redirect(dest, code=302)
+
+
 @app.route('/hostile/redirect-loop/a')
 def redirect_loop_a():
-    """Redirect to /hostile/redirect-loop/b. SAFE-006"""
+    """Redirect to /hostile/redirect-loop/b. SAFE-002"""
     dest = "/hostile/redirect-loop/b"
     log_test_hit("redirect_loop_a", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -473,7 +493,7 @@ def redirect_loop_a():
 
 @app.route('/hostile/redirect-loop/b')
 def redirect_loop_b():
-    """Redirect to /hostile/redirect-loop/c. SAFE-006"""
+    """Redirect to /hostile/redirect-loop/c. SAFE-002"""
     dest = "/hostile/redirect-loop/c"
     log_test_hit("redirect_loop_b", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -481,7 +501,7 @@ def redirect_loop_b():
 
 @app.route('/hostile/redirect-loop/c')
 def redirect_loop_c():
-    """Redirect to /hostile/redirect-loop/a (completes the loop). SAFE-006"""
+    """Redirect to /hostile/redirect-loop/a (completes the loop). SAFE-002"""
     dest = "/hostile/redirect-loop/a"
     log_test_hit("redirect_loop_c", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -489,7 +509,7 @@ def redirect_loop_c():
 
 @app.route('/hostile/self-loop')
 def self_loop():
-    """302 redirect to itself. SAFE-006"""
+    """302 redirect to itself. SAFE-002"""
     dest = request.url
     log_test_hit("self_loop", request.method, request.path, 302, redirect_dest=dest)
     return redirect(dest, code=302)
@@ -506,8 +526,8 @@ def large_body():
     except ValueError:
         size_mb = 10
 
-    # Clamp to valid range: default 10MB, max 20MB
-    size_mb = max(1, min(size_mb, 20))
+    # Clamp to valid range: default 10MB, max 20MB (MAX_BODY_SIZE)
+    size_mb = max(1, min(size_mb, MAX_BODY_SIZE // (1024 * 1024)))
     size_bytes = size_mb * 1024 * 1024
 
     log_test_hit("large_body", request.method, request.path, 200,
@@ -556,11 +576,9 @@ def slow_body():
 # ============================================================================
 @app.route('/hostile/gzip-bomb')
 def gzip_bomb():
-    """Returns gzip-compressed response (~20KB compressed → ~10MB decompressed). SAFE-003"""
-    decompressed_size = 10 * 1024 * 1024  # 10MB
-
-    # Estimate compressed size for Content-Length (zeros compress to ~0.1%)
-    estimated_compressed_size = max(1024, decompressed_size // 1000)  # ~10KB for 10MB of zeros
+    """Returns gzip-compressed response (~10KB compressed → ~10MB decompressed). SAFE-003"""
+    decompressed_size = MAX_GZIP_DECOMPRESSED
+    estimated_compressed_size = 10 * 1024  # zeros gzip to ~10 KB; estimate only, not a Content-Length guarantee
 
     log_test_hit("gzip_bomb", request.method, request.path, 200,
                  body_size=estimated_compressed_size,
@@ -581,47 +599,11 @@ def gzip_bomb():
 
 
 # ============================================================================
-# Malformed Responses (Placeholders - actual wire-level malformed served by malformed_server.py on localhost:9999)
-# ============================================================================
-@app.route('/hostile/malformed/chunked')
-def malformed_chunked():
-    """Placeholder for invalid chunked encoding. Actual test on localhost:9999/malformed/chunked. SAFE-004"""
-    log_test_hit("malformed_chunked", request.method, request.path, 200)
-    return Response(
-        "Malformed chunked encoding test endpoint. Actual wire-level malformed response served by malformed_server.py on localhost:9999/malformed/chunked\n"
-        "Violations: invalid hex chunk length (GARBAGE), missing chunk data, proper terminator for recovery testing.",
-        mimetype='text/plain'
-    )
-
-
-@app.route('/hostile/malformed/tls')
-def malformed_tls():
-    """Placeholder for malformed TLS - handled by separate listener. SAFE-004"""
-    log_test_hit("malformed_tls", request.method, request.path, 200)
-    return Response(
-        "Malformed TLS test endpoint. Actual malformed TLS handling requires a separate TLS listener on a different port.\n"
-        "Test cases: invalid ClientHello, garbled ServerHello, wrong TLS version, invalid ASN.1 cert, heartbeat misuse.",
-        mimetype='text/plain'
-    )
-
-
-@app.route('/hostile/malformed/banner')
-def malformed_banner():
-    """Placeholder for junk HTTP banner. Actual test on localhost:9999/malformed/banner. SAFE-004"""
-    log_test_hit("malformed_banner", request.method, request.path, 200)
-    return Response(
-        "Junk HTTP banner test endpoint. Actual wire-level malformed response served by malformed_server.py on localhost:9999/malformed/banner\n"
-        "Violations: control chars in header value (\\x00-\\x03, \\xFC-\\xFF), binary data in body, non-UTF-8 sequences, no Content-Length.",
-        mimetype='text/plain'
-    )
-
-
-# ============================================================================
 # Read-Only Observer
 # ============================================================================
 @app.route('/hostile/read-only', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
 def read_only():
-    """Records HTTP method, path, headers. Returns 200 with observation logged. SAFE-001"""
+    """Records HTTP method, path, headers. Returns 200 with observation logged. SAFE-005"""
     log_test_hit("read_only", request.method, request.path, 200)
     log_observation("read_only", request.method, request.path, dict(request.headers))
 
@@ -637,12 +619,12 @@ def read_only():
 # ============================================================================
 @app.route('/hostile/kill-test')
 def kill_test():
-    """Holds connection alive for 30 seconds then closes. SAFE-001"""
-    log_test_hit("kill_test", request.method, request.path, 200, delay_profile="30s hold")
+    """Holds connection alive for 15 seconds then closes. SAFE-006"""
+    log_test_hit("kill_test", request.method, request.path, 200, delay_profile=f"{MAX_KILL_HOLD}s hold")
 
     def generate():
-        yield b"Connection held for 30 seconds...\n"
-        time.sleep(30)
+        yield b"Connection held for 15 seconds...\n"
+        time.sleep(MAX_KILL_HOLD)
         yield b"Closing connection now.\n"
 
     return Response(
@@ -669,6 +651,5 @@ def internal_observation():
 # Main Entry Point
 # ============================================================================
 if __name__ == '__main__':
-    # This is a hostile test target - bind to all interfaces for testing
-    # In production this would be behind a reverse proxy
-    app.run(host='0.0.0.0', port=MAIN_PORT, threaded=True)
+    # This is a hostile test target - bind to localhost for Nginx proxying
+    app.run(host='127.0.0.1', port=MAIN_PORT, threaded=True)

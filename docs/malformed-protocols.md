@@ -10,9 +10,9 @@ This document describes the malformed protocol test endpoints in Site 7. These t
 
 | Principle | Implementation |
 |-----------|----------------|
-| **Isolated from main app** | Separate server process on localhost:9999 |
+| **Isolated from main app** | Separate server processes on localhost:9998 (malformed TLS) and localhost:9999 (malformed HTTP) |
 | **No main site breakage** | Nginx/Flask app remains standards-compliant |
-| **Contained scope** | Only accessible via localhost or explicit test config |
+| **Contained scope** | Only accessible via SNI routing on port 443 |
 | **Deterministic** | Same malformed responses every time |
 | **No code execution** | Pure protocol violations, no payloads |
 | **Observable** | Structured logging of every connection |
@@ -23,28 +23,38 @@ This document describes the malformed protocol test endpoints in Site 7. These t
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      SCANNER (External)                          │
+│                      SCANNER (External)                         │
 └─────────────────────────────────────────────────────────────────┘
                                     │
-                    ┌───────────────┴───────────────┐
-                    ▼                               ▼
-        ┌───────────────────────┐         ┌───────────────────────┐
-        │   Nginx :80/:443      │         │  Malformed Server     │
-        │   (Standards Compliant)│         │  :9999 (localhost)    │
-        └───────────┬───────────┘         └───────────┬───────────┘
-                    │                               │
-                    ▼                               ▼
-        ┌───────────────────────┐         ┌───────────────────────┐
-        │   Flask App :5000     │         │  - Invalid Chunked    │
-        │   /malformed/*        │         │  - Junk Banner        │
-        │   (Placeholders)      │         │  (No TLS test here)   │
-        └───────────────────────┘         └───────────────────────┘
+                          ┌─────────┴─────────┐
+                          ▼                   ▼
+              ┌───────────────────┐   ┌───────────────────┐
+              │   Nginx :80/:443  │   │  DNS :53          │
+              │  SNI Routing      │   │  (Rebinding)      │
+              └─────────┬─────────┘   └───────────────────┘
+                        │
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+┌──────────────────┐ ┌─────────┐ ┌─────────┐
+│  Default Backend │ │:9998    │ │:9999    │
+│  127.0.0.1:8443  │ │Malformed│ │Malformed│
+│  → Flask :5000   │ │ TLS     │ │ HTTP    │
+└──────────────────┘ └─────────┘ └─────────┘
 ```
 
-**Key Separation**: The main Flask app provides *placeholder* endpoints for malformed tests (returning 200 with explanation). The **actual malformed protocol violations** are served by the separate `malformed_server.py` on localhost:9999. This ensures:
+**Key Separation**: The main Flask app serves standards-compliant endpoints. The **actual malformed protocol violations** are served by separate servers:
+- **Port 9998**: Raw malformed TLS (garbled ServerHello)
+- **Port 9999**: Valid TLS handshake → raw malformed HTTP bytes
+
+Nginx SNI routing on port 443 directs traffic:
+- `malformed-tls.paleon-lab-hostile.com` → 127.0.0.1:9998
+- `malformed-http.paleon-lab-hostile.com` → 127.0.0.1:9999
+- `default` → 127.0.0.1:8443 → Flask app on 127.0.0.1:5000
+
+This ensures:
 - Main site passes TLS/HTTP compliance checks
 - Malformed tests don't affect legitimate traffic
-- Scanner can be pointed specifically at malformed endpoints for testing
+- Scanner can be pointed specifically at malformed subdomains for testing
 
 ---
 
@@ -52,35 +62,29 @@ This document describes the malformed protocol test endpoints in Site 7. These t
 
 ### 3.1 Invalid Chunked Encoding (`/malformed/chunked`)
 
-**Endpoint**: `http://127.0.0.1:9999/malformed/chunked`
+**Endpoint**: `https://malformed-http.paleon-lab-hostile.com/malformed/chunked`
 
-**Violation**: Multiple chunked encoding errors in single response
+**Violation**: Invalid chunked encoding with garbage chunk length
 
-**Raw Response**:
+**Raw Response** (after valid TLS handshake):
 ```
 HTTP/1.1 200 OK
-Transfer-Encoding: chunked
 Content-Type: text/plain
-X-Test: malformed-chunked
+Transfer-Encoding: chunked
 
 5
-hello
+HELLO
 GARBAGE
-3
-foo
-
 0
 
 ```
 
 **Specific Violations**:
-1. `GARBAGE` — Not a valid hex chunk length
-2. Empty line after `3\r\nfoo\r\n` — Missing chunk data for what should be a 3-byte chunk
-3. Proper terminator `0\r\n\r\n` at end (to test parser recovery)
+1. `GARBAGE` — Not a valid hex chunk length (should be hex digits only)
+2. Proper terminator `0\r\n\r\n` at end (to test parser recovery)
 
 **Expected Scanner Behavior**:
 - ✅ Detect invalid hex length, reject response
-- ✅ Detect missing chunk data, reject response
 - ✅ Not crash, not hang, not execute content
 - ✅ Log parsing error and continue scan
 
@@ -88,28 +92,23 @@ foo
 
 ### 3.2 Junk HTTP Banner (`/malformed/banner`)
 
-**Endpoint**: `http://127.0.0.1:9999/malformed/banner`
+**Endpoint**: `https://malformed-http.paleon-lab-hostile.com/malformed/banner`
 
-**Violation**: HTTP-like response with binary garbage in headers and body
+**Violation**: HTTP response with control characters in header value
 
-**Raw Response**:
+**Raw Response** (after valid TLS handshake):
 ```
 HTTP/1.1 200 OK
-Server: Paleon-Hostile-Malformed/7.0
-X-Junk-Banner: \x00\x01\x02\x03\xFF\xFE\xFD\xFC
-Content-Type: text/plain
-Connection: close
+X-Control-Header: \x00\x01\x02\x03
+Content-Length: 14
 
-This is a junk HTTP banner response.\x00\x01\x02\x03
-\xFF\xFE\xFD\xFC\xFB\xFA\xF9
-Extra garbage: \x80\x81\x82\x83\x84\x85
+MALFORMED_HEADER
 ```
 
 **Specific Violations**:
-1. Control characters in header value (`\x00-\x03`, `\xFC-\xFF`)
+1. Control characters in header value (`\x00-\x03`)
 2. Binary data in response body
 3. Non-UTF-8 sequences
-4. No `Content-Length`, uses `Connection: close`
 
 **Expected Scanner Behavior**:
 - ✅ Handle binary headers without crash
@@ -119,54 +118,91 @@ Extra garbage: \x80\x81\x82\x83\x84\x85
 
 ---
 
-### 3.3 Malformed TLS (Placeholder in Main App, Separate Listener Required)
+### 3.3 Malformed TLS (`https://malformed-tls.paleon-lab-hostile.com/`)
 
-**Main App Endpoint**: `GET /hostile/malformed/tls` → Returns explanatory text
+**Endpoint**: `https://malformed-tls.paleon-lab-hostile.com/`
 
-**Actual Test**: Requires a separate TLS listener that:
-- Sends invalid ClientHello
-- Sends garbled ServerHello
-- Uses wrong TLS version
-- Sends certificate with invalid ASN.1
-- Performs heartbeat extension misuse (like Heartbleed test)
+**Violation**: Garbled TLS ServerHello during handshake
 
-**Implementation Note**: 
-> A full malformed TLS test requires a custom TLS stack (not OpenSSL) because OpenSSL validates before handing to application. Options:
-> 1. Use `scapy` to craft raw TLS records
-> 2. Use a modified `tlslite-ng` or similar
-> 3. Use a dedicated fuzzer like `tlsfuzzer`
-> 4. Document as "requires separate TLS test harness"
+**Raw Response** (TLS Record Layer):
+```
+0x16 0x03 0x03 0x00 0x10 0x02 0x00 0x00 0x0c 0x03 0x03
+0xFF 0xFE 0xFD 0xFC 0xFB 0xFA 0xF9 0xF8 0xF7 0xF6
+```
 
-**For Site 7**: The placeholder endpoint documents this requirement. A production test harness would deploy a separate TLS fuzzer on another localhost port.
+**Breakdown**:
+- `0x16` — TLS Record Type: Handshake (22)
+- `0x03 0x03` — TLS Version: 1.2
+- `0x00 0x10` — Record Length: 16 bytes
+- `0x02` — Handshake Type: ServerHello (2)
+- `0x00 0x00 0x0c` — Handshake Length: 12 bytes
+- `0x03 0x03` — Version: TLS 1.2
+- `0xFF 0xFE 0xFD 0xFC 0xFB 0xFA 0xF9 0xF8 0xF7 0xF6` — **GARBAGE** (10 bytes of invalid random/version data)
+
+**Expected Scanner Behavior**:
+- ✅ Detect malformed ServerHello during handshake
+- ✅ TLS library raises SSL error / handshake failure
+- ✅ Not crash, not hang
+- ✅ Fail certificate validation cleanly
+- ✅ Log TLS error and continue scan
 
 ---
 
-## 4. Malformed Server Implementation (`app/malformed_server.py`)
+## 4. Server Implementation Details
 
-### Server Configuration
+### Malformed TLS Server (Port 9998)
+
 ```python
 HOST = '127.0.0.1'
-PORT = 9999
+PORT_TLS = 9998
 MAX_CONNECTIONS = 10
-IDLE_TIMEOUT = 30  # seconds
+IDLE_TIMEOUT = 30
 ```
 
-### Connection Management
-- **Connection cap**: 10 concurrent connections
-- **Idle reaper**: Background thread checks every 5s, closes connections idle >30s
-- **Thread-per-connection**: Each request handled in daemon thread
-- **Graceful shutdown**: `KeyboardInterrupt` closes all connections
+**Behavior**:
+1. Accepts TCP connection
+2. Reads ClientHello (fragmentation-tolerant)
+3. Sends garbled ServerHello (see 3.3 above)
+4. Closes connection
 
-### Request Handling
+**Connection Management**:
+- Connection cap: 10 concurrent
+- Idle reaper: Background thread checks every 5s, closes connections idle >30s
+- Bounded worker pool: each accepted connection runs on a `ThreadPoolExecutor` worker guarded by a `BoundedSemaphore`, so no more than the cap run concurrently
+
+---
+
+### Malformed HTTP Server (Port 9999)
+
 ```python
-# Reads request headers only (up to \r\n\r\n)
-# Determines response type by path:
-#   /malformed/chunked  -> invalid chunked
-#   /malformed/banner   -> junk banner
-#   (default)           -> invalid chunked
+HOST = '127.0.0.1'
+PORT_HTTP = 9999
+MAX_CONNECTIONS = 10
+IDLE_TIMEOUT = 30
+CERT_FILE = "/etc/ssl/site7/site7.crt"
+KEY_FILE = "/etc/ssl/site7/site7.key"
 ```
 
-### Logging
+**Behavior**:
+1. Accepts TCP connection
+2. Performs valid TLS handshake using site certificate
+3. Reads HTTP request headers (fragmentation-tolerant)
+4. Routes based on request path:
+   - `/malformed/chunked` → Invalid chunked encoding
+   - `/malformed/banner` → Control chars in header
+5. Sends malformed HTTP response
+6. Attempts graceful TLS unwrap
+7. Closes connection
+
+**Connection Management**:
+- Connection cap: 10 concurrent
+- Idle reaper: Background thread checks every 5s, closes connections idle >30s
+- Bounded worker pool: each accepted connection runs on a `ThreadPoolExecutor` worker guarded by a `BoundedSemaphore`, so no more than the cap run concurrently
+
+---
+
+### Logging (Both Servers)
+
 Structured JSON for every event:
 - `connection_accepted` — New connection with ID, client IP
 - `request_received` — Truncated request preview (no sensitive data)
@@ -178,15 +214,13 @@ Structured JSON for every event:
 
 ---
 
-## 5. Expected Scanner Behavior (SAFE-004)
+## 5. Expected Scanner Behavior (SAFE-004 / SAFE-004-TLS)
 
 | Test | Scanner Must |
 |------|--------------|
-| Invalid Chunked | Detect malformed chunk lengths; not crash; not hang; fail gracefully |
-| Junk Banner | Handle binary headers/body; not crash; close connection cleanly |
-| Malformed TLS* | Detect invalid TLS handshake; not crash; fail certificate validation |
-
-*Malformed TLS requires separate test harness
+| Invalid Chunked (SAFE-004) | Detect malformed chunk lengths; not crash; not hang; fail gracefully |
+| Junk Banner (SAFE-004) | Handle binary headers/body; not crash; close connection cleanly |
+| Malformed TLS (SAFE-004-TLS) | Detect invalid TLS handshake; not crash; fail certificate validation |
 
 ### Fail Criteria
 - ❌ Scanner segfaults, panics, or exits abnormally
@@ -199,30 +233,37 @@ Structured JSON for every event:
 
 ## 6. Verification Commands
 
-### Invalid Chunked
+### Invalid Chunked (via SNI)
 ```bash
-# Raw connection to see malformed response
-nc 127.0.0.1 9999 << 'EOF'
+# From external - connects to malformed-http subdomain on 443
+curl -I https://malformed-http.paleon-lab-hostile.com/malformed/chunked
+
+# Raw connection via SNI (requires OpenSSL s_client)
+openssl s_client -connect malformed-http.paleon-lab-hostile.com:443 -servername malformed-http.paleon-lab-hostile.com << 'EOF'
 GET /malformed/chunked HTTP/1.1
-Host: localhost
+Host: malformed-http.paleon-lab-hostile.com
 
 EOF
 ```
 
-### Junk Banner
+### Junk Banner (via SNI)
 ```bash
-nc 127.0.0.1 9999 << 'EOF'
+curl -I https://malformed-http.paleon-lab-hostile.com/malformed/banner
+
+openssl s_client -connect malformed-http.paleon-lab-hostile.com:443 -servername malformed-http.paleon-lab-hostile.com << 'EOF'
 GET /malformed/banner HTTP/1.1
-Host: localhost
+Host: malformed-http.paleon-lab-hostile.com
 
 EOF
 ```
 
-### Using curl (will likely fail/close)
+### Malformed TLS (via SNI)
 ```bash
-# These will show curl's handling of malformed responses
-curl -v http://127.0.0.1:9999/malformed/chunked
-curl -v http://127.0.0.1:9999/malformed/banner
+# Should fail with SSL error
+curl -I https://malformed-tls.paleon-lab-hostile.com/
+
+# Raw TLS handshake
+openssl s_client -connect malformed-tls.paleon-lab-hostile.com:443 -servername malformed-tls.paleon-lab-hostile.com
 ```
 
 ---
@@ -233,7 +274,7 @@ curl -v http://127.0.0.1:9999/malformed/banner
 
 | Myth | Reality |
 |------|---------|
-| "Executes shell commands" | Pure HTTP response; no shell, no eval |
+| "Executes shell commands" | Pure HTTP/TLS response; no shell, no eval |
 | "Installs malware" | Static bytes; no file write, no execution |
 | "Exfiltrates data" | Server only sends; doesn't read request body |
 | "Crashes the OS" | User-space TCP server; kernel unaffected |
@@ -244,6 +285,7 @@ curl -v http://127.0.0.1:9999/malformed/banner
 - Idle timeout prevents connection leaks
 - Daemon threads die with main process
 - No global state that survives restart
+- Bounded read buffers (4096 bytes max)
 
 ---
 
@@ -253,14 +295,19 @@ curl -v http://127.0.0.1:9999/malformed/banner
 - id: SAFE-004
   category: parser_safety
   targets:
-    - https://paleon-lab-hostile.com/hostile/malformed/chunked
-    - https://paleon-lab-hostile.com/hostile/malformed/banner
+    - https://malformed-http.paleon-lab-hostile.com/malformed/chunked
+    - https://malformed-http.paleon-lab-hostile.com/malformed/banner
   expect: "malformed response parsed defensively; scanner does not crash"
   severity: high
   claim: observed
-```
 
-**Note**: The `expected.yaml` references the main app placeholder endpoints. The actual malformed tests require pointing the scanner at `http://127.0.0.1:9999/malformed/*` directly (or configuring the scanner to test the malformed server port).
+- id: SAFE-004-TLS
+  category: parser_safety
+  target: https://malformed-tls.paleon-lab-hostile.com/
+  expect: "malformed TLS ServerHello parsed defensively; scanner does not crash"
+  severity: high
+  claim: observed
+```
 
 ---
 
@@ -268,17 +315,19 @@ curl -v http://127.0.0.1:9999/malformed/banner
 
 | Issue | Cause | Resolution |
 |-------|-------|------------|
-| Server won't start | Port 9999 in use | `ss -tlnp | grep 9999` and kill |
+| Server won't start | Port 9998/9999 in use | `ss -tlnp | grep -E '9998|9999'` and kill |
 | Connections rejected | At MAX_CONNECTIONS | Wait for idle reaper or increase limit |
 | No logs | Logging not configured | Check stdout/stderr; JSONFormatter outputs to stdout |
-| Scanner doesn't see malformed | Testing wrong endpoint | Use `http://127.0.0.1:9999/...` not `https://.../hostile/malformed/...` |
+| Scanner doesn't see malformed | Testing wrong endpoint | Use `https://malformed-http...` or `https://malformed-tls...` on 443 |
+| TLS cert missing | Certbot failed, self-signed used | Check `/etc/ssl/site7/site7.crt` and `.key` exist |
+| Permission denied on key | Key permissions wrong | `chmod 640 /etc/ssl/site7/site7.key && chown root:site7-tls /etc/ssl/site7/site7.key` |
 
 ---
 
 ## 10. Future Enhancements
 
-1. **Malformed TLS Harness**: Deploy `tlsfuzzer` or custom TLS stack on port 9998
-2. **HTTP/2 Malformed**: Add h2c cleartext HTTP/2 with invalid frames
-3. **HTTP Smuggling**: TE.CL and CL.TE desync test cases
-4. **Response Splitting**: Header injection test cases
-5. **WebSocket Malformed**: Invalid WebSocket handshake frames
+1. **HTTP/2 Malformed**: Add h2c cleartext HTTP/2 with invalid frames
+2. **HTTP Smuggling**: TE.CL and CL.TE desync test cases
+3. **Response Splitting**: Header injection test cases
+4. **WebSocket Malformed**: Invalid WebSocket handshake frames
+5. **Additional TLS violations**: Invalid certificates, heartbeat misuse, version rollback

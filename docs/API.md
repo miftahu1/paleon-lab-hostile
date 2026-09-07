@@ -2,8 +2,8 @@
 
 ## Base URL
 - **HTTP**: `http://paleon-lab-hostile.com` (via nginx on port 80)
-- **HTTPS**: `https://paleon-lab-hostile.com` (via nginx on port 443, when configured)
-- **Direct Flask**: `http://<host>:5000` (internal, not recommended for scanning)
+- **HTTPS**: `https://paleon-lab-hostile.com` (via nginx on port 443, when TLS configured)
+- **Direct Flask**: `http://127.0.0.1:5000` (internal, not publicly accessible)
 
 ## Endpoint Categories
 
@@ -14,8 +14,14 @@ All SSRF endpoints return **HTTP 302** with a `Location` header pointing to a da
 #### GET /hostile/ssrf/fargate
 - **Test ID**: SSRF-001
 - **Response**: 302 Found
-- **Location**: `http://169.254.170.2/v2/credentials`
+- **Location**: `http://169.254.170.2/v2/credentials/TEST_ONLY`
 - **Purpose**: Simulates redirect to AWS Fargate credentials endpoint
+
+#### GET /hostile/ssrf/fargate-relative
+- **Test ID**: SSRF-001
+- **Response**: 302 Found
+- **Location**: `http://169.254.170.2/v2/credentials/test-site7`
+- **Purpose**: Simulates redirect to AWS Fargate credentials endpoint with test path
 
 #### GET /hostile/ssrf/imds
 - **Test ID**: SSRF-002
@@ -26,25 +32,26 @@ All SSRF endpoints return **HTTP 302** with a `Location` header pointing to a da
 #### GET /hostile/ssrf/rfc1918
 - **Test ID**: SSRF-003
 - **Response**: 302 Found
-- **Location**: `http://10.0.0.1/admin`
+- **Location**: `http://10.0.0.1/` (or 172.16.0.1, 192.168.0.1 based on `target` param)
+- **Parameters**: `target=10|172|192` (default: 10)
 - **Purpose**: Simulates redirect to RFC1918 private address
 
 #### GET /hostile/ssrf/localhost
 - **Test ID**: SSRF-004
 - **Response**: 302 Found
-- **Location**: `http://127.0.0.1:8080/internal`
+- **Location**: `http://127.0.0.1/`
 - **Purpose**: Simulates redirect to IPv4 loopback
 
 #### GET /hostile/ssrf/ipv6-loopback
 - **Test ID**: SSRF-004
 - **Response**: 302 Found
-- **Location**: `http://[::1]:8080/internal`
+- **Location**: `http://[::1]/`
 - **Purpose**: Simulates redirect to IPv6 loopback
 
 #### GET /hostile/ssrf/ipv6-private
 - **Test ID**: SSRF-004
 - **Response**: 302 Found
-- **Location**: `http://[fc00::1]/internal`
+- **Location**: `http://[fd00::1]/`
 - **Purpose**: Simulates redirect to IPv6 ULA (Unique Local Address)
 
 ---
@@ -54,19 +61,24 @@ All SSRF endpoints return **HTTP 302** with a `Location` header pointing to a da
 #### GET /hostile/scope-escape
 - **Test ID**: SAFE-001
 - **Response**: 302 Found
-- **Location**: `https://offscope.paleon-lab-hostile.com/`
+- **Location**: `https://offscope.paleon-lab-hostile.com/landing`
 - **Purpose**: Tests that scanner does not follow redirects to off-scope hosts
 
 ---
 
 ### Redirect Safety Endpoint (High)
 
-#### GET /hostile/redirect-loop
-#### GET /hostile/redirect-loop/<step>
+#### GET /hostile/redirect-loop/a
+#### GET /hostile/redirect-loop/b
+#### GET /hostile/redirect-loop/c
 - **Test ID**: SAFE-002
-- **Response**: 302 Found (steps 1-4), 200 OK (step 5)
-- **Chain**: `/redirect-loop` → `/redirect-loop/2` → `/redirect-loop/3` → `/redirect-loop/4` → `/redirect-loop/5` (200)
-- **Purpose**: Tests redirect loop detection and termination within configured limit
+- **Response**: 302 Found at every step, including `/redirect-loop/c`
+- **Chain**: `/redirect-loop` → `/redirect-loop/a` → `/redirect-loop/b` → `/redirect-loop/c` → `/redirect-loop/a` (unbounded cycle; the target never self-terminates)
+- **Purpose**: Tests that the scanner detects the cycle and stops within its own hop limit — the target does not break the loop for it
+
+#### GET /hostile/self-loop
+- **Response**: 302 Found to self
+- **Purpose**: Self-referential redirect for loop detection
 
 ---
 
@@ -76,16 +88,16 @@ All SSRF endpoints return **HTTP 302** with a `Location` header pointing to a da
 - **Test ID**: SAFE-003
 - **Response**: 200 OK
 - **Content-Type**: `application/octet-stream`
-- **Content-Length**: `15728640` (15 MB)
-- **Transfer-Encoding**: chunked (streamed in 1MB chunks)
+- **Content-Length**: Variable (via `size_mb` parameter, default 10, max 20)
+- **Streaming**: Body is generated and streamed server-side without buffering in RAM; a fixed `Content-Length` is declared (this endpoint is **not** `Transfer-Encoding: chunked`)
 - **Purpose**: Tests response size bounding
 
 #### GET /hostile/slow-body
 - **Test ID**: SAFE-003
 - **Response**: 200 OK
-- **Content-Type**: `text/plain`
-- **Transfer-Encoding**: chunked
-- **Duration**: ~5 seconds (50 chunks × 100ms)
+- **Content-Type**: `application/octet-stream`
+- **Transfer-Encoding**: chunked (streamed; no `Content-Length`)
+- **Duration**: Variable (via `delay_ms` parameter, default 5000, min 100, max 15000)
 - **Purpose**: Tests response duration bounding
 
 #### GET /hostile/gzip-bomb
@@ -93,42 +105,34 @@ All SSRF endpoints return **HTTP 302** with a `Location` header pointing to a da
 - **Response**: 200 OK
 - **Content-Type**: `application/gzip`
 - **Content-Encoding**: `gzip`
-- **Content-Length**: ~1 KB (compressed)
-- **Uncompressed Size**: 100 MB
+- **X-Decompressed-Size**: `10485760` (declared decompressed byte count)
+- **Content-Length**: none — the compressed body (~10 KB) is streamed, so no `Content-Length` is sent
+- **Uncompressed Size**: exactly 10485760 bytes (10 MiB)
 - **Purpose**: Tests decompression ratio bounding
 
 ---
 
 ### Parser Safety Endpoints (High)
 
-#### GET /hostile/malformed/chunked
+#### GET https://malformed-http.paleon-lab-hostile.com/malformed/chunked
 - **Test ID**: SAFE-004
-- **Response**: 200 OK
+- **Response**: 200 OK (after valid TLS handshake)
 - **Transfer-Encoding**: `chunked`
-- **Body**: Malformed chunked encoding with invalid hex chunk size (`GARBAGE`)
+- **Body**: Valid chunk followed by invalid hex chunk size (`GARBAGE`), then proper terminator
 - **Purpose**: Tests defensive parsing of malformed chunked responses
 
-#### GET /hostile/malformed/banner
+#### GET https://malformed-http.paleon-lab-hostile.com/malformed/banner
 - **Test ID**: SAFE-004
-- **Response**: 999 (Invalid status code)
-- **Content-Type**: `text/plain`
-- **Body**: `Body content`
-- **Purpose**: Tests handling of invalid HTTP status lines
+- **Response**: 200 OK (after valid TLS handshake)
+- **Headers**: Contains control characters (`\x00\x01\x02\x03`) in header value
+- **Body**: `MALFORMED_HEADER`
+- **Purpose**: Tests handling of control characters in HTTP headers
 
----
-
-### Additional Malformed Endpoints (Port 5001)
-
-These endpoints are served by the malformed_server.py on port 5001:
-
-| Endpoint | Description |
-|----------|-------------|
-| `/malformed/no-status` | Response missing status line |
-| `/malformed/bad-header` | Header without colon separator |
-| `/malformed/no-crlf` | Header missing CRLF termination |
-| `/malformed/bad-chunk` | Invalid chunk size in chunked encoding |
-| `/malformed/premature-close` | Connection closed before Content-Length fulfilled |
-| `/malformed/null-bytes` | Null bytes in header values |
+#### GET https://malformed-tls.paleon-lab-hostile.com/
+- **Test ID**: SAFE-004-TLS
+- **Response**: TLS handshake fails with malformed ServerHello
+- **ServerHello**: Garbled payload with invalid version/random bytes
+- **Purpose**: Tests defensive handling of malformed TLS handshake
 
 ---
 
@@ -137,14 +141,14 @@ These endpoints are served by the malformed_server.py on port 5001:
 #### GET /hostile/read-only
 - **Test ID**: SAFE-005
 - **Response**: 200 OK
-- **Content-Type**: `application/json`
-- **Body**: `{"status": "ok", "message": "Read-only endpoint - no state changes", "test_id": "SAFE-005"}`
-- **Methods**: GET only (POST/PUT/DELETE return 405)
+- **Content-Type**: `text/plain`
+- **Body**: `OK - Request observed and logged`
+- **Methods**: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS (all logged; **every** method returns 200)
 - **Purpose**: Verifies scanner makes no state-changing requests during passive scan
 
-#### POST /hostile/read-only
-- **Response**: 405 Method Not Allowed
-- **Purpose**: Should be logged as passive safety violation if attempted
+#### POST /hostile/read-only (and other methods)
+- **Response**: 200 OK (but logged as observation)
+- **Purpose**: Should be logged as passive safety observation if attempted
 
 ---
 
@@ -152,27 +156,22 @@ These endpoints are served by the malformed_server.py on port 5001:
 
 #### GET /hostile/kill-test
 - **Test ID**: SAFE-006
-- **Response**: 200 OK
-- **Content-Type**: `application/json`
-- **Body**: `{"status": "ok", "message": "Kill test endpoint - scanner should handle termination cleanly", "test_id": "SAFE-006"}`
-- **Purpose**: Endpoint for testing scanner termination behavior
+- **Response**: 200 OK (streaming)
+- **Content-Type**: `text/plain`
+- **Behavior**: Holds connection for 15 seconds then closes
+- **Purpose**: Tests scanner termination behavior
 
 ---
 
 ### DNS Rebinding Safety (Critical)
 
-#### rebind-test.paleon-lab-hostile.com (DNS on port 8053 UDP)
+#### rebind-test.paleon-lab-hostile.com (DNS on port 53 UDP/TCP)
 - **Test ID**: SAFE-007
-- **First Query**: Returns A record `203.0.113.42` (public)
-- **Subsequent Queries**: Returns A record `10.0.0.50` (private)
+- **First Query**: Returns A record = Site 7 EIP (public)
+- **Subsequent Queries**: Returns A record `192.168.1.1` (private)
 - **TTL**: 0 (no caching)
+- **Flags**: AA=1 (authoritative), RA=0 (no recursion)
 - **Purpose**: Tests that scanner re-validates DNS on reconnect and refuses private address after rebinding
-
-#### GET http://rebind-test.paleon-lab-hostile.com:5002/rebind-test
-- **Response**: 200 OK
-- **Content-Type**: `application/json`
-- **Body**: Includes current DNS state and query count
-- **Purpose**: HTTP endpoint to verify rebinding state
 
 ---
 
@@ -182,26 +181,30 @@ These endpoints are served by the malformed_server.py on port 5001:
 - **Response**: 200 OK
 - **Content-Type**: `application/json`
 - **Body**: Observation logs (last 100 entries)
+- **Access**: Localhost only (127.0.0.1, ::1)
+- **Purpose**: Access observation logs for verification
+
 ```json
 {
   "observations": [
     {
       "timestamp": "2026-09-04T12:00:00Z",
-      "event_type": "ssrf_redirect_attempt",
-      "client_ip": "192.0.2.1",
-      "user_agent": "Scanner/1.0",
-      "details": {"target": "fargate", "redirect_to": "http://169.254.170.2"}
+      "test_id": "ssrf_fargate",
+      "method": "GET",
+      "path": "/hostile/ssrf/fargate",
+      "status": 302,
+      "redirect_destination": "http://169.254.170.2/v2/credentials/TEST_ONLY",
+      "body_size_bytes": 0,
+      "off_scope_attempt": false
     }
-  ],
-  "total_files": 1
+  ]
 }
 ```
-- **Purpose**: Access observation logs for verification
 
 #### GET /health
 - **Response**: 200 OK
 - **Content-Type**: `application/json`
-- **Body**: `{"status": "healthy", "service": "paleon-site7"}`
+- **Body**: `{"status": "ok", "service": "paleon-site7"}`
 - **Purpose**: Health check endpoint
 
 ---
@@ -219,12 +222,12 @@ These endpoints are served by the malformed_server.py on port 5001:
 
 ### Resource Endpoints
 - `Content-Length`: Size in bytes (large-body)
-- `Transfer-Encoding`: chunked (slow-body, large-body)
+- `Transfer-Encoding`: chunked (slow-body, gzip-bomb — both streamed without Content-Length)
 - `Content-Encoding`: gzip (gzip-bomb)
 
-### Malformed Endpoints
+### Malformed Endpoints (via SNI)
 - `Transfer-Encoding`: chunked (malformed/chunked)
-- No special headers (malformed/banner)
+- `X-Control-Header`: Contains control chars (malformed/banner)
 
 ---
 
@@ -232,8 +235,9 @@ These endpoints are served by the malformed_server.py on port 5001:
 
 | Status | Condition |
 |--------|-----------|
+| 403 | Internal endpoint accessed from non-localhost |
 | 404 | Unknown endpoint |
-| 405 | Method not allowed (e.g., POST /hostile/read-only) |
+| 405 | Method not allowed (rare - most endpoints accept all methods) |
 | 500 | Internal server error (should not occur in normal operation) |
 | 503 | Service unavailable (during restart) |
 

@@ -6,20 +6,14 @@
 # No shared resources with other Paleon test sites.
 #
 # Topology:
-#   EC2 (Ubuntu 24.04 LTS)
-#     - Security Group: HTTP/HTTPS from anywhere, SSH from admin_ip only
-#     - DNS (TCP/UDP 53) from anywhere for rebinding tests
-#     - Elastic IP for stable DNS
-#     - User data bootstraps via terraform/user_data.sh.tftpl
-#   Route 53
-#     - paleon-lab-hostile.com             -> EIP
-#     - offscope.paleon-lab-hostile.com     -> EIP (same server)
-#     - rebind-test.paleon-lab-hostile.com  -> public test IP (first lookup)
+#   EC2 (Ubuntu 24.04 LTS, default VPC)
+#     - Public ports: 22 (admin CIDR), 53 TCP/UDP, 80, 443
+#     - Elastic IP allocated first, then associated (no dependency cycle)
+#     - User data receives the EIP via templatefile (no IMDS / no external IP lookup)
+#   Route 53 (parent zone paleon-lab-hostile.com)
+#     - A: apex, offscope, malformed-http, malformed-tls, ns1
+#     - NS: rebind-test.paleon-lab-hostile.com -> ns1.paleon-lab-hostile.com
 # ==============================================================================
-
-# ------------------------------------------------------------------------------
-# Provider
-# ------------------------------------------------------------------------------
 
 provider "aws" {
   region = var.aws_region
@@ -39,16 +33,13 @@ provider "aws" {
 # Data Sources
 # ------------------------------------------------------------------------------
 
-# Retrieve the VPC default for the selected region. Site 7 uses the default
-# VPC to keep the lab simple; no custom networking is created.
 data "aws_vpc" "default" {
   default = true
 }
 
-# Discover the latest Ubuntu 24.04 LTS AMI in the selected region
 data "aws_ami" "ubuntu_2404" {
   most_recent = true
-  owners      = ["099720109477"]  # Canonical
+  owners      = ["099720109477"] # Canonical
 
   filter {
     name   = "name"
@@ -70,13 +61,11 @@ data "aws_ami" "ubuntu_2404" {
 # Security Group
 # ------------------------------------------------------------------------------
 
-# Site 7 hostile test target - no shared resources with other sites.
 resource "aws_security_group" "paleon-site7-sg" {
   name        = "${var.project_name}-sg"
   description = "Site 7 hostile test target - no shared resources with other sites"
   vpc_id      = data.aws_vpc.default.id
 
-  # HTTP from anywhere -- required for the web-based test targets.
   ingress {
     description = "HTTP from anywhere"
     from_port   = 80
@@ -85,17 +74,14 @@ resource "aws_security_group" "paleon-site7-sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # HTTPS from anywhere -- required for TLS test scenarios.
   ingress {
-    description = "HTTPS from anywhere"
+    description = "HTTPS from anywhere (SNI routing)"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # SSH from admin_ip only -- restrict to the operator's IP.
-  # admin_ip must be provided; deployment fails without it.
   ingress {
     description = "SSH from admin IP only"
     from_port   = 22
@@ -104,7 +90,6 @@ resource "aws_security_group" "paleon-site7-sg" {
     cidr_blocks = [var.admin_ip]
   }
 
-  # DNS (TCP) for DNS rebinding tests - from anywhere
   ingress {
     description = "DNS TCP for rebinding tests"
     from_port   = 53
@@ -113,7 +98,6 @@ resource "aws_security_group" "paleon-site7-sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # DNS (UDP) for DNS rebinding tests - from anywhere
   ingress {
     description = "DNS UDP for rebinding tests"
     from_port   = 53
@@ -122,12 +106,28 @@ resource "aws_security_group" "paleon-site7-sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # No explicit outbound rules beyond AWS defaults.
-  # Default egress allows all outbound traffic which is needed for
-  # package updates and pulling dependencies during user_data bootstrap.
-  # We document this as intentional: HTTPS outbound for updates only.
+  # Default AWS egress (all outbound) is retained so bootstrap can apt/git.
+  # Application processes are later restricted on-host with iptables uid rules.
   tags = {
     Name = "${var.project_name}-sg"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Elastic IP (allocated independently of the instance — no cycle)
+# ------------------------------------------------------------------------------
+# Cycle-safe lifecycle:
+#   1. Allocate EIP (public_ip known immediately)
+#   2. Create instance (user_data injects that public_ip)
+#   3. Associate EIP to instance
+# Instance user_data must NOT reference the association, and the EIP resource
+# must NOT set instance = aws_instance.id.
+
+resource "aws_eip" "paleon-site7-eip" {
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.project_name}-eip"
   }
 }
 
@@ -135,18 +135,24 @@ resource "aws_security_group" "paleon-site7-sg" {
 # EC2 Instance
 # ------------------------------------------------------------------------------
 
-# Main Site 7 test target instance. Deliberately has NO IAM instance profile
-# or role attached -- the test target should have minimal AWS permissions.
 resource "aws_instance" "paleon-site7" {
   ami                    = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu_2404.id
   instance_type          = var.instance_type
   key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.paleon-site7-sg.id]
 
-  # No IAM instance profile -- intentionally minimal permissions.
-  # iam_instance_profile = (not set)
+  # No IAM instance profile — intentionally minimal permissions.
 
-  user_data = file("${path.module}/user_data.sh.tftpl")
+  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
+    domain_name = var.hostname
+    public_ip   = aws_eip.paleon-site7-eip.public_ip
+  })
+  user_data_replace_on_change = true
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required" # IMDSv2 required; application code must not call IMDS
+  }
 
   root_block_device {
     volume_size = 20
@@ -159,53 +165,73 @@ resource "aws_instance" "paleon-site7" {
   }
 }
 
-# ------------------------------------------------------------------------------
-# Elastic IP
-# ------------------------------------------------------------------------------
-
-# Stable public IP for the Site 7 test target. Used for all DNS A records.
-resource "aws_eip" "paleon-site7-eip" {
-  instance = aws_instance.paleon-site7.id
-  domain   = "vpc"
-
-  tags = {
-    Name = "${var.project_name}-eip"
-  }
+resource "aws_eip_association" "paleon-site7-eip" {
+  instance_id   = aws_instance.paleon-site7.id
+  allocation_id = aws_eip.paleon-site7-eip.id
 }
 
 # ------------------------------------------------------------------------------
 # Route 53 DNS Records
 # ------------------------------------------------------------------------------
 
-# Primary domain record -- points to the Elastic IP.
 resource "aws_route53_record" "paleon-site7-primary" {
   zone_id = var.route53_zone_id
   name    = var.hostname
   type    = "A"
   ttl     = 300
   records = [aws_eip.paleon-site7-eip.public_ip]
+
+  depends_on = [aws_eip_association.paleon-site7-eip]
 }
 
-# Off-scope subdomain -- same server handles both primary and off-scope
-# hostnames. Useful for testing scope-based access controls.
 resource "aws_route53_record" "paleon-site7-offscope" {
   zone_id = var.route53_zone_id
   name    = var.offscope_hostname
   type    = "A"
   ttl     = 300
   records = [aws_eip.paleon-site7-eip.public_ip]
+
+  depends_on = [aws_eip_association.paleon-site7-eip]
 }
 
-# DNS rebinding test hostname. The initial A record points to a public test IP
-# to simulate a rebinding scenario where the first lookup resolves to an
-# external address before switching to the actual server.
-resource "aws_route53_record" "paleon-site7-rebind" {
+resource "aws_route53_record" "paleon-site7-malformed-http" {
+  zone_id = var.route53_zone_id
+  name    = "malformed-http.${var.hostname}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_eip.paleon-site7-eip.public_ip]
+
+  depends_on = [aws_eip_association.paleon-site7-eip]
+}
+
+resource "aws_route53_record" "paleon-site7-malformed-tls" {
+  zone_id = var.route53_zone_id
+  name    = "malformed-tls.${var.hostname}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_eip.paleon-site7-eip.public_ip]
+
+  depends_on = [aws_eip_association.paleon-site7-eip]
+}
+
+# Glue A record: ns1 hostname resolves to the Site 7 EIP
+resource "aws_route53_record" "paleon-site7-ns1" {
+  zone_id = var.route53_zone_id
+  name    = "ns1.${var.hostname}"
+  type    = "A"
+  ttl     = 300
+  records = [aws_eip.paleon-site7-eip.public_ip]
+
+  depends_on = [aws_eip_association.paleon-site7-eip]
+}
+
+# NS delegation: rebind-test child zone is served by the instance DNS daemon
+resource "aws_route53_record" "paleon-site7-rebind-ns" {
   zone_id = var.route53_zone_id
   name    = var.rebind_hostname
-  type    = "A"
-  ttl     = 60
-  # Initial value is a well-known public test IP for DNS rebinding demos.
-  # After bootstrap, the TTL is lowered and the record is updated to point
-  # to the EIP via a separate process.
-  records = ["93.184.216.34"]
+  type    = "NS"
+  ttl     = 300
+  records = ["ns1.${var.hostname}"]
+
+  depends_on = [aws_eip_association.paleon-site7-eip]
 }

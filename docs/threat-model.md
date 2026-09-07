@@ -26,7 +26,7 @@ This document describes the threat model for PALEON TEST SITE 7, a deliberately 
 - ❌ Cannot access AWS metadata services (169.254.169.254, 169.254.170.2)
 - ❌ Cannot read environment variables containing secrets
 - ❌ Cannot execute arbitrary shell commands
-- ❌ Cannot access filesystem beyond `/var/lib/site7` (observations) and `/tmp`
+- ❌ Cannot access filesystem beyond `/var/lib/site7` (DNS rebind state only) and `/tmp`
 - ❌ Cannot proxy attacker requests into internal networks
 - ❌ Cannot relay credentials
 - ❌ Cannot scan internal networks
@@ -88,23 +88,24 @@ The scanner is the system under test. The safety properties of the scanner runti
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        TRUSTED: PALEON SCANNER                          │
-│  - Scanner runtime, policies, limits, logging                          │
+│  - Scanner runtime, policies, limits, logging                           │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                      TRUST BOUNDARY: NETWORK                            │
-│  - HTTPS/TLS (ports 80/443)                                            │
-│  - DNS queries (port 53, but rebind uses 5353 localhost)               │
+│  - HTTPS/TLS (ports 80/443)                                             │
+│  - DNS queries (port 53 TCP/UDP) — rebind-test is authoritative DNS    │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    UNTRUSTED: SITE 7 HOSTILE TARGET                     │
-│  - Flask application (port 5000 behind Nginx)                          │
-│  - Malformed protocol server (port 9999, localhost only)               │
-│  - DNS rebind server (port 5353, localhost only)                       │
-│  - All responses are adversarial by design                             │
+│  - Flask application (port 5000 behind Nginx)                           │
+│  - Malformed TLS server (port 9998, 127.0.0.1 only)                     │
+│  - Malformed HTTP server (port 9999, 127.0.0.1 only)                    │
+│  - DNS rebind server (port 53 TCP/UDP, 0.0.0.0 — public authoritative)  │
+│  - All responses are adversarial by design                              │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                     ┌───────────────┼───────────────┐
@@ -131,7 +132,7 @@ The scanner is the system under test. The safety properties of the scanner runti
 | Surface | Description | Mitigation |
 |---------|-------------|------------|
 | HTTP Redirects | 3xx responses with Location headers to prohibited destinations | URL validation, scope enforcement, private IP blocklist |
-| DNS Rebinding | TTL=0, changing A records from public → private | DNS pinning, re-validation on reconnect |
+| DNS Rebinding | TTL=0, changing A records from public → private (authoritative DNS on port 53) | DNS pinning, re-validation on reconnect |
 | Response Body Size | Streaming large or infinite bodies | Body size ceiling, streaming parse |
 | Response Duration | Slowloris-style slow streaming | Read timeout, global time budget |
 | Decompression | Gzip bombs (high ratio) | Decompression ceiling, streaming decompress |

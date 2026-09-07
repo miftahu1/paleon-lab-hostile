@@ -11,13 +11,13 @@ curl -s http://localhost:5000/health
 ./verify.sh
 
 # Check all services
-systemctl is-active paleon-site7.service site7-malformed.service site7-rebind-dns.service nginx
+systemctl is-active paleon-site7.service site7-malformed-server.service site7-rebind-dns.service nginx
 ```
 
 ### Log Monitoring
 ```bash
 # Follow all service logs
-journalctl -u paleon-site7 -u site7-malformed -u site7-rebind-dns -f
+journalctl -u paleon-site7 -u site7-malformed-server -u site7-rebind-dns -f
 
 # Nginx access logs
 tail -f /var/log/nginx/access.log
@@ -29,15 +29,14 @@ tail -f /var/log/nginx/error.log
 ## Weekly Maintenance
 
 ### Log Rotation
-Observation logs are daily JSONL files in `/var/lib/site7/observations/`. They are not automatically rotated.
+Observations are **not** written to disk — they live in an in-memory `deque(maxlen=100)` inside the Flask process and are discarded on restart, so there are no observation files to rotate. Service output goes to the systemd journal; bound it with the standard journald controls if needed:
 
 ```bash
-# Archive old logs (older than 30 days)
-find /var/lib/site7/observations -name "*.jsonl" -mtime +30 -exec gzip {} \;
+# Cap journal size
+journalctl --vacuum-size=200M
 
-# Or move to archive
-mkdir -p /var/lib/site7/observations/archive
-find /var/lib/site7/observations -name "*.jsonl" -mtime +30 -exec mv {} /var/lib/site7/observations/archive/ \;
+# Or bound by age
+journalctl --vacuum-time=30d
 ```
 
 ### Disk Space Check
@@ -79,9 +78,9 @@ ss -tlnp | grep :5000
 
 **Malformed Server**
 ```bash
-systemctl status site7-malformed
-journalctl -u site7-malformed -n 50
-systemctl restart site7-malformed
+systemctl status site7-malformed-server
+journalctl -u site7-malformed-server -n 50
+systemctl restart site7-malformed-server
 ```
 
 **DNS Rebinding**
@@ -91,7 +90,7 @@ journalctl -u site7-rebind-dns -n 50
 systemctl restart site7-rebind-dns
 
 # Test DNS
-dig @localhost -p 8053 rebind-test.paleon-lab-hostile.com
+dig @localhost rebind-test.paleon-lab-hostile.com
 ```
 
 **Nginx**
@@ -105,13 +104,13 @@ systemctl restart nginx
 ### Port Conflicts
 ```bash
 # Check what's using expected ports
-ss -tlnp | grep -E ':(5000|5001|5002|8053|80|443)'
+ss -tlnp | grep -E ':(5000|8443|9998|9999|53|80|443)'
 
 # Kill conflicting process (if not ours)
 kill -9 <PID>
 
 # Restart our services
-systemctl restart paleon-site7 site7-malformed site7-rebind-dns nginx
+systemctl restart paleon-site7 site7-malformed-server site7-rebind-dns nginx
 ```
 
 ### High Memory/CPU
@@ -120,20 +119,22 @@ systemctl restart paleon-site7 site7-malformed site7-rebind-dns nginx
 top -p $(pgrep -f "paleon-site7|malformed_server|rebind_dns")
 
 # Restart if needed
-systemctl restart paleon-site7 site7-malformed site7-rebind-dns
+systemctl restart paleon-site7 site7-malformed-server site7-rebind-dns
 ```
 
-### Observation Log Issues
+### Observation Issues
+Observations are held in memory and served from `GET /internal/site7-observation` (localhost-only). There is no observation directory to inspect or chown.
+
 ```bash
-# Check log directory
-ls -la /var/lib/site7/observations/
+# View current in-memory observations (run ON the instance; endpoint is localhost-only)
+curl -s http://127.0.0.1:5000/internal/site7-observation | jq .
 
-# Check permissions
-ls -la /var/lib/site7/
+# If empty, generate traffic then re-check
+curl -s -o /dev/null http://127.0.0.1:5000/hostile/ssrf/imds
+curl -s http://127.0.0.1:5000/internal/site7-observation | jq '.observations | length'
 
-# Fix permissions if needed
-chown -R site7:site7 /var/lib/site7/
-chmod 755 /var/lib/site7/observations
+# Observations reset to empty whenever the Flask service restarts
+systemctl restart paleon-site7
 ```
 
 ## Reset Procedures
@@ -142,51 +143,40 @@ chmod 755 /var/lib/site7/observations
 ```bash
 ./reset.sh
 ```
-This:
-- Stops all Site 7 services
-- Clears observation logs (`*.jsonl`)
-- Resets DNS rebinding state
-- Clears temp directory
-- Restarts all services
+This (see `reset.sh`):
+- Stops the Site 7 services
+- Resets DNS rebinding state to the initial public / zero-count value (`/var/lib/site7/rebind-state.json`)
+- Restarts all services (which discards the in-memory observation deque)
+- Runs a health gate: verifies every service is active, all expected ports listen, and `/health` responds
 
 ### Hard Reset (Full Redeploy)
 ```bash
 # From local machine
-terraform apply -replace=aws_instance.site7
+terraform apply -replace=aws_instance.paleon-site7
 
 # Or manually on instance
-sudo systemctl stop paleon-site7 site7-malformed site7-rebind-dns nginx
+sudo systemctl stop paleon-site7 site7-malformed-server site7-rebind-dns nginx
 sudo rm -rf /opt/paleon-site7/* /var/lib/site7/*
 # Re-run bootstrap or re-deploy via Terraform
 ```
 
 ## Backup & Recovery
 
+Site 7 is a stateless test target, so there is almost nothing to back up:
+
 ### What to Backup
-- **Terraform State**: Stored in S3 backend (automatic)
-- **Observation Logs**: `/var/lib/site7/observations/` (optional, for analysis)
-- **Rebind State**: `/var/lib/site7/rebind-state.json` (optional)
-
-### Backup Commands
-```bash
-# Backup observations
-tar -czf /tmp/site7-observations-$(date +%Y%m%d).tar.gz /var/lib/site7/observations/
-
-# Backup rebind state
-cp /var/lib/site7/rebind-state.json /tmp/rebind-state-$(date +%Y%m%d).json
-
-# Copy to S3 (if configured)
-aws s3 cp /tmp/site7-observations-$(date +%Y%m%d).tar.gz s3://your-bucket/backups/site7/
-```
+- **Terraform State**: stored in the S3 backend (authoritative; recreates all infrastructure)
+- **Application code**: this Git repository
+- **Observations**: nothing to back up — they are in-memory only and intentionally ephemeral
+- **Rebind state** (`/var/lib/site7/rebind-state.json`): a transient DNS counter that `reset.sh` regenerates, so a backup is not needed
 
 ### Recovery
 ```bash
-# Restore observations
-tar -xzf site7-observations-20260904.tar.gz -C /
+# Full rebuild from code (preferred): re-run Terraform
+terraform apply
 
-# Restore rebind state
-cp rebind-state-20260904.json /var/lib/site7/rebind-state.json
-chown site7:site7 /var/lib/site7/rebind-state.json
+# Or restore a known-good runtime state on the instance
+sudo ./reset.sh
 ```
 
 ## Security Operations
@@ -220,25 +210,24 @@ ss -tlnp
 
 ## Performance Tuning
 
-### Flask Workers (if using gunicorn)
-Current setup uses Flask development server. For production load:
+### Flask Workers
+The deployed unit runs the app directly (`ExecStart=/usr/bin/python3 /opt/paleon-site7/deployed_app.py`) with the threaded Werkzeug server (`app.run(threaded=True)`), which is sufficient for a single-instance test target. If you ever need more concurrency, `gunicorn` is present in `requirements.txt` and can back the same WSGI app:
 ```bash
-# Install gunicorn (already in requirements.txt)
-# Modify paleon-site7.service:
-ExecStart=/usr/bin/gunicorn --workers 4 --bind 0.0.0.0:5000 app:app
+# Optional: switch paleon-site7.service ExecStart to gunicorn
+ExecStart=/usr/bin/gunicorn --workers 4 --bind 127.0.0.1:5000 deployed_app:app
 ```
 
 ### Nginx Tuning
 ```nginx
-# In /etc/nginx/nginx.conf or site7.conf
+# In /etc/nginx/nginx.conf
 worker_processes auto;
 worker_connections 1024;
 
 # Proxy buffers for large/slow responses
 proxy_buffering off;
 proxy_request_buffering off;
-proxy_read_timeout 300s;
-proxy_send_timeout 300s;
+proxy_read_timeout 20s;
+proxy_send_timeout 20s;
 ```
 
 ### System Limits
@@ -266,7 +255,7 @@ echo "site7 hard nofile 65536" >> /etc/security/limits.conf
 curl -f http://localhost:5000/health || alert
 
 # DNS rebinding functional
-dig @localhost -p 8053 rebind-test.paleon-lab-hostile.com +short | grep -E "203\.0\.113\.42|10\.0\.0\.50" || alert
+dig @localhost rebind-test.paleon-lab-hostile.com +short | grep -E "<EIP>|192\.168\.1\.1" || alert
 
 # Observation logging working
 curl -s http://localhost:5000/internal/site7-observation | jq -e '.observations | length > 0' || alert
@@ -288,22 +277,27 @@ curl -s http://localhost:5000/internal/site7-observation | jq -e '.observations 
 ### Debug Mode
 ```bash
 # Enable Flask debug (temporary only!)
-sed -i 's/debug=False/debug=True/' /opt/paleon-site7/app.py
+sed -i 's/debug=False/debug=True/' /opt/paleon-site7/deployed_app.py
 systemctl restart paleon-site7
 # REMEMBER TO DISABLE AFTER DEBUGGING
 ```
 
 ### Log Analysis
+Observations come from the in-memory endpoint (localhost-only), not from files:
 ```bash
-# Count SSRF attempts by type
-grep "ssrf_redirect_attempt" /var/lib/site7/observations/*.jsonl | jq -r '.details.target' | sort | uniq -c
+# Snapshot current observations
+curl -s http://127.0.0.1:5000/internal/site7-observation > /tmp/obs.json
+
+# Count SSRF attempts by target
+jq -r '.observations[] | select(.event_type=="ssrf_redirect_attempt") | .details.target' /tmp/obs.json | sort | uniq -c
 
 # Top scanning IPs
-grep "client_ip" /var/lib/site7/observations/*.jsonl | jq -r '.client_ip' | sort | uniq -c | sort -rn | head -20
+jq -r '.observations[].client_ip' /tmp/obs.json | sort | uniq -c | sort -rn | head -20
 
-# Timeline of attacks
-grep "timestamp" /var/lib/site7/observations/*.jsonl | head -5
+# Most recent events
+jq -r '.observations[-5:][] | "\(.timestamp) \(.event_type)"' /tmp/obs.json
 ```
+Note: the deque holds at most 100 entries and is cleared on restart, so this is a live snapshot, not a historical archive.
 
 ## Upgrade Procedures
 
@@ -317,8 +311,11 @@ grep "timestamp" /var/lib/site7/observations/*.jsonl | head -5
 terraform apply
 
 # OR deploy in-place (faster, but mutable)
-scp app.py malformed_server.py rebind_dns.py ubuntu@<ip>:/opt/paleon-site7/
-ssh ubuntu@<ip> "sudo systemctl restart paleon-site7 site7-malformed site7-rebind-dns"
+# Services execute the deployed_*.py copies, so land the files under those names:
+scp app/app.py ubuntu@<ip>:/tmp/deployed_app.py
+scp app/malformed_server.py ubuntu@<ip>:/tmp/deployed_malformed_server.py
+scp app/rebind_dns_server.py ubuntu@<ip>:/tmp/deployed_rebind_dns_server.py
+ssh ubuntu@<ip> "sudo cp /tmp/deployed_*.py /opt/paleon-site7/ && sudo systemctl restart paleon-site7 site7-malformed-server site7-rebind-dns"
 ```
 
 ### Terraform Version Upgrade
@@ -347,4 +344,4 @@ terraform init -upgrade
 
 | Date | Change | Author |
 |------|--------|--------|
-| 2026-09-04 | Initial deployment | Paleon Team |
+| 2026-09-07 | Updated for final architecture | Paleon Team |

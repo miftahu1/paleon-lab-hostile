@@ -112,7 +112,7 @@ Each test case specifies:
 |-------|-------|
 | **Test ID** | SAFE-003 |
 | **Category** | resource_safety |
-| **Endpoints** | `/hostile/large-body?size_mb=50`, `/hostile/slow-body?delay_ms=30000`, `/hostile/gzip-bomb` |
+| **Endpoints** | `/hostile/large-body?size_mb=20`, `/hostile/slow-body?delay_ms=15000`, `/hostile/gzip-bomb` |
 | **Stimulus** | Large streaming response, slow streaming response, decompression bomb |
 | **Expected Scanner Behavior** | Scanner should enforce body size limit, read timeout, and decompression ceiling; no OOM or hang |
 | **Expected Target Observation** | Streaming logs for each endpoint; no full payload allocated in RAM |
@@ -121,20 +121,35 @@ Each test case specifies:
 | **Blocker** | Yes |
 | **Claim Strength** | Observed behavior: scanner bounded response size and duration; no resource runaway |
 
-### SAFE-004: Malformed Protocol Handling
+### SAFE-004: Malformed Protocol Handling (HTTP)
 
 | Field | Value |
 |-------|-------|
 | **Test ID** | SAFE-004 |
 | **Category** | parser_safety |
-| **Endpoints** | `/hostile/malformed/chunked`, `/hostile/malformed/banner` |
-| **Stimulus** | Invalid chunked encoding, junk HTTP banner with binary data |
+| **Endpoints** | `https://malformed-http.paleon-lab-hostile.com/malformed/chunked`, `https://malformed-http.paleon-lab-hostile.com/malformed/banner` |
+| **Stimulus** | Invalid chunked encoding (GARBAGE chunk size), junk HTTP banner with control chars in header (`\x00\x01\x02\x03`) |
 | **Expected Scanner Behavior** | Scanner should parse defensively; fail gracefully without crash; continue scan |
-| **Expected Target Observation** | Connection logs showing malformed responses sent |
+| **Expected Target Observation** | Connection logs showing malformed responses sent via malformed-http server on 9999 (via SNI on 443) |
 | **Evidence to Collect** | Scanner crash log (must be empty), scan completion status, error handling behavior |
 | **Severity** | HIGH |
 | **Blocker** | Yes |
-| **Claim Strength** | Observed behavior: scanner survived malformed responses without crash |
+| **Claim Strength** | Observed behavior: scanner survived malformed HTTP responses without crash |
+
+### SAFE-004-TLS: Malformed TLS Handling
+
+| Field | Value |
+|-------|-------|
+| **Test ID** | SAFE-004-TLS |
+| **Category** | parser_safety |
+| **Endpoint** | `https://malformed-tls.paleon-lab-hostile.com/` |
+| **Stimulus** | Malformed TLS ServerHello with invalid version/random bytes (garbled handshake) |
+| **Expected Scanner Behavior** | Scanner should detect invalid TLS handshake; fail certificate validation cleanly; no crash |
+| **Expected Target Observation** | Connection logs showing garbled ServerHello sent via malformed-tls server on 9998 (via SNI on 443) |
+| **Evidence to Collect** | Scanner crash log (must be empty), TLS error handling, scan completion status |
+| **Severity** | HIGH |
+| **Blocker** | Yes |
+| **Claim Strength** | Observed behavior: scanner survived malformed TLS handshake without crash |
 
 ### SAFE-005: Passive Scanning Only (Read-Only)
 
@@ -158,9 +173,9 @@ Each test case specifies:
 | **Test ID** | SAFE-006 |
 | **Category** | termination_safety |
 | **Endpoint** | `https://paleon-lab-hostile.com/hostile/kill-test` |
-| **Stimulus** | Connection held for 30 seconds |
+| **Stimulus** | Connection held for 15 seconds |
 | **Expected Scanner Behavior** | Scanner should terminate cleanly when operator kills scan; no orphan processes, no runaway connections |
-| **Expected Target Observation** | Connection log showing 30s hold; no spawned processes from target |
+| **Expected Target Observation** | Connection log showing 15s hold; no spawned processes from target |
 | **Evidence to Collect** | Process list before/after kill (no orphan PIDs), connection count before/after, clean exit status |
 | **Severity** | MEDIUM |
 | **Blocker** | No |
@@ -172,8 +187,8 @@ Each test case specifies:
 |-------|-------|
 | **Test ID** | SAFE-007 |
 | **Category** | dns_rebinding_safety |
-| **Target** | `rebind-test.paleon-lab-hostile.com` (UDP 5353 on localhost:5353) |
-| **Stimulus** | First DNS lookup returns public IP (93.184.216.34); subsequent lookups return private IP (192.168.1.1) with TTL=0 |
+| **Target** | `rebind-test.paleon-lab-hostile.com` (DNS on port 53 TCP/UDP, authoritative on Site 7 EIP) |
+| **Stimulus** | First DNS lookup returns Site 7 EIP (public); subsequent lookups return private IP (192.168.1.1) with TTL=0 |
 | **Expected Scanner Behavior** | Scanner should re-validate DNS resolution on reconnect; detect rebinding; refuse connection to private address |
 | **Expected Target Observation** | DNS query logs showing sequence (public → private); scanner refusing private address |
 | **Evidence to Collect** | DNS server logs showing query sequence, scanner DNS resolution logs, scanner policy decision |

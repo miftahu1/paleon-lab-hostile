@@ -6,7 +6,7 @@ This document describes how to deploy PALEON TEST SITE 7 in an isolated environm
 
 - AWS account with permissions to create EC2, EIP, Route53 records, and Security Groups
 - Terraform >= 1.5.0
-- DNS zone for `paleon-lab-hostile.com` (or use a test domain)
+- DNS zone for `paleon-lab-hostile.com` (or use a test domain) hosted in Route 53
 - SSH key pair for EC2 access (optional but recommended)
 - Approximately 15-20 minutes for deployment
 
@@ -15,8 +15,8 @@ This document describes how to deploy PALEON TEST SITE 7 in an isolated environm
 ### 1. Clone Repository
 
 ```bash
-git clone <repository-url>
-cd C:/Users/mifta/Desktop/Paleon/Test Sites/hostile
+git clone https://github.com/miftahu1/paleon-lab-hostile.git
+cd paleon-lab-hostile
 ```
 
 ### 2. Configure Variables
@@ -29,17 +29,17 @@ aws_region              = "us-east-1"
 hostname                = "paleon-lab-hostile.com"
 offscope_hostname       = "offscope.paleon-lab-hostile.com"
 rebind_hostname         = "rebind-test.paleon-lab-hostile.com"
-route53_zone_id         = "Z3M3LMPEXAMPLE"  # Your hosted zone ID
-admin_ip                = "203.0.113.50/32"   # Your IP for SSH access
-key_name                = "my-site7-key"      # Existing EC2 key pair name
+route53_zone_id         = "Z3M3LMPEXAMPLE"   # Your hosted zone ID
+admin_ip                = "203.0.113.50/32"  # Your IP for SSH access
+key_name                = "my-site7-key"     # Existing EC2 key pair name
 
-# Optional variables (use defaults if not specified)
+# Optional variables (defaults shown)
 instance_type           = "t3.micro"
-ami_id                  = "ami-0c101f26f147fa7fd"  # Amazon Linux 2023
+ami_id                  = ""                  # empty = auto-discover latest Ubuntu 24.04 LTS
 project_name            = "paleon-site7"
 ```
 
-> **Note**: The `route53_zone_id` is required. If you don't have a hosted zone, create one first in AWS Route53.
+> **Note**: `route53_zone_id` and `admin_ip` are required in practice (their defaults are empty). Leave `ami_id` empty to let Terraform select the most recent Canonical Ubuntu 24.04 LTS AMI in the region; override it only to pin a specific Ubuntu 24.04 image.
 
 ### 3. Initialize Terraform
 
@@ -48,15 +48,13 @@ cd terraform
 terraform init
 ```
 
-This initializes the local backend (state stored in `terraform.tfstate`).
-
 ### 4. Review Deployment Plan
 
 ```bash
 terraform plan -var-file=../terraform.tfvars
 ```
 
-Review the plan carefully. All resources will be created with the `paleon-site7` prefix.
+Review the plan carefully. All resources are created with the `paleon-site7` prefix.
 
 ### 5. Apply Deployment
 
@@ -65,73 +63,59 @@ terraform apply -var-file=../terraform.tfvars
 ```
 
 Type `yes` when prompted. The deployment will:
-- Create a security group allowing HTTP/HTTPS from anywhere and SSH from your admin IP only
-- Launch an EC2 instance (t3.micro, Amazon Linux 2023) with NO IAM role
-- Allocate and associate an Elastic IP
-- Create Route53 A records for all three hostnames
-- Execute the user data bootstrap script
+- Create a security group allowing HTTP/HTTPS and DNS (TCP+UDP 53) from anywhere, and SSH from your admin IP only
+- Launch an EC2 instance (`t3.micro`, Ubuntu 24.04 LTS) with **no IAM role** and IMDSv2 required
+- Allocate an Elastic IP and attach it via `aws_eip_association`
+- Create Route 53 records: `A` for apex, `offscope`, `malformed-http`, `malformed-tls`, and `ns1` (all → EIP), plus an `NS` record delegating `rebind-test` to `ns1`
+- Execute the user-data bootstrap script
 
 ### 6. Post-Deployment Verification
 
-After approximately 5-10 minutes (for bootstrap completion), run:
+After approximately 5-10 minutes (for bootstrap completion), run the runtime verifier against the instance EIP:
 
 ```bash
-../verify.sh
+../verify.sh <eip>
 ```
 
-This script verifies:
-- Services are reachable
-- Hostname resolution works
-- All test endpoints return correct headers
-- No unexpected ports are exposed
-- Systemd services are healthy
+This script verifies, over the network:
+- Hostname/SNI routing works
+- Test endpoints return the correct headers / raw bytes
+- Malformed HTTP and malformed TLS behave as designed (raw-byte inspection, not `curl | grep`)
+- The DNS rebinding contract holds (public first, private after, TTL=0)
+
+For an automated public-boundary check, also run:
+
+```bash
+python3 ../test_all_endpoints.py <eip>
+```
 
 ### 7. Accessing the Site
 
 Once deployed, access via:
-- Primary: https://paleon-lab-hostile.com
-- Off-scope: https://offscope.paleon-lab-hostile.com
-- Rebind test: rebind-test.paleon-lab-hostile.com (DNS only)
+- Primary: `https://paleon-lab-hostile.com`
+- Off-scope: `https://offscope.paleon-lab-hostile.com`
+- Malformed HTTP: `https://malformed-http.paleon-lab-hostile.com/malformed/{chunked,banner}`
+- Malformed TLS: `https://malformed-tls.paleon-lab-hostile.com/` (handshake never completes)
+- Rebind test: `rebind-test.paleon-lab-hostile.com` (DNS only, delegated to `ns1`)
 
-> **Important**: The off-scope and rebind hostnames point to the same server. The distinction is purely for testing scope enforcement and DNS rebinding scenarios.
+> **Important**: The apex, off-scope, malformed, and `ns1` names all resolve to the same EIP. The distinction is purely for testing scope enforcement, SNI-based malformed routing, and DNS rebinding.
 
 ## Local Development / Testing
 
-For local testing without AWS:
-
-### Using Docker Compose
+There is no container stack. For local iteration, run the services directly with Python.
 
 ```bash
-docker compose up -d
+# Install dependencies (single requirements file at the repo root)
+pip install -r requirements.txt
+
+# Main Flask app — binds 127.0.0.1:5000
+python3 app/app.py
 ```
 
-This starts:
-- Flask app on port 5000
-- Malformed test server on port 9999
-- DNS rebind server on port 5353
-- Nginx reverse proxy on ports 80/443
-
-Verify with:
-```bash
-../verify.sh
-```
-
-Reset with:
-```bash
-docker compose down -v
-docker compose up -d
-```
-
-### Manual Python Execution
+The malformed server needs a TLS certificate/key at `/etc/ssl/site7/` and the DNS server needs to bind port 53 (privileged), so both are normally exercised on the deployed instance under `systemd` rather than locally. To validate the repository statically without any host:
 
 ```bash
-# Install dependencies
-pip install -r app/requirements.txt
-
-# Start services in separate terminals:
-python app/app.py                    # Main Flask app
-python app/malformed_server.py       # Malformed responses
-python app/rebind_dns_server.py      # DNS rebind server
+./validate.sh
 ```
 
 ## Reset Procedures
@@ -145,72 +129,67 @@ cd terraform
 terraform destroy -var-file=../terraform.tfvars
 ```
 
-This removes ALL resources created by Terraform. The Elastic IP will be released back to AWS.
+This removes ALL resources created by Terraform. The Elastic IP is released back to AWS.
 
 ### Service-Only Reset
 
-To reset just the application state (keeping infrastructure):
+To reset just the application state on the instance (keeping infrastructure):
 
 ```bash
-../reset.sh
+sudo ./reset.sh
 ```
 
-This stops services, clears observation logs and temporary state, then restarts services.
-
-### Local Docker Reset
-
-```bash
-docker compose down -v    # Stops containers and removes volumes
-docker compose up -d      # Recreates and starts fresh
-```
+This stops the services, restores the DNS-rebinding state file to its initial (public-first) condition, and restarts the services. In-memory observations are discarded automatically when the Flask service restarts — there are no on-disk observation logs to clear.
 
 ## DNS Rebind Testing
 
-The DNS rebind test uses a separate process. To manually test:
+The DNS rebind test is served by `site7-rebind-dns` on port 53. To manually test on the instance (or against the EIP):
 
-1. First lookup (should return public IP):
+1. First lookup (should return the public EIP):
    ```bash
-   dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com
+   dig @127.0.0.1 rebind-test.paleon-lab-hostile.com A +short
    ```
 
-2. Second lookup (should return private IP):
+2. Second lookup (should return `192.168.1.1`):
    ```bash
-   dig @127.0.0.1 -p 5353 rebind-test.paleon-lab-hostile.com
+   dig @127.0.0.1 rebind-test.paleon-lab-hostile.com A +short
    ```
 
 To reset the rebind state:
 ```bash
-python app/rebind_dns_server.py reset
+sudo ./reset.sh
+# or, directly:
+python3 app/rebind_dns_server.py reset
 ```
 
 ## Security Notes
 
 ### Isolation Features
 
-1. **No IAM Role**: The EC2 instance has no attached IAM role or instance profile
-2. **Security Group**: 
-   - Ingress: HTTP/HTTPS from 0.0.0.0/0, SSH from admin_ip only
-   - No explicit egress restrictions (AWS default allows all outbound for updates)
+1. **No IAM Role**: The EC2 instance has no attached IAM role or instance profile, and IMDSv2 is required — there are no role credentials to steal.
+2. **Security Group**:
+   - Ingress: HTTP/HTTPS and DNS (TCP+UDP 53) from `0.0.0.0/0`; SSH from `admin_ip` only
+   - Default AWS egress is retained so bootstrap can `apt`/`git`; application egress is restricted on-host (see below)
    - No shared security groups with other sites
-3. **Network**: 
-   - Uses default VPC (no custom VPC, IGW, NAT, etc.)
+3. **Network**:
+   - Uses the default VPC (no custom VPC, IGW, or NAT created)
    - No VPC peering, Transit Gateway, or VPN connections
-   - No routing to private networks
-4. **Application**:
-   - No outbound network calls from Flask app
-   - Malformed and DNS servers bind to 127.0.0.1 only
-   - No credentials, secrets, or tokens stored
-   - No database or external API calls
+4. **Host egress isolation**:
+   - `iptables`/`ip6tables` `owner --uid-owner site7` rules `REJECT` traffic from the `site7` user to RFC1918, link-local (`169.254.0.0/16`), and IPv6 ULA/link-local ranges
+   - Installed by `site7-egress-firewall.service`, a `systemd` oneshot ordered before networking, so it **persists across reboot**
+5. **Application**:
+   - No outbound network calls from any service
+   - Flask, the Nginx termination, and the malformed backends bind `127.0.0.1` only
+   - No credentials, secrets, tokens, or database
 
 ### What Site 7 Does NOT Do
 
-- ✅ No outbound calls to metadata services (169.254.169.254, 169.254.170.2)
+- ✅ No outbound calls to metadata services (`169.254.169.254`, `169.254.170.2`) — these appear only as redirect `Location` bait
 - ✅ No proxying or relaying of requests
 - ✅ No credential harvesting or storage
 - ✅ No execution of arbitrary code
-- ✅ No filesystem access beyond /tmp and /var/lib/site7
+- ✅ No persistent storage of scan data (observations are in-memory only)
 - ✅ No network scanning or port scanning
-- ✅ No persistent storage of scan data
 
 ## Troubleshooting
 
@@ -219,8 +198,9 @@ python app/rebind_dns_server.py reset
 Check logs:
 ```bash
 journalctl -u paleon-site7 -f
-journalctl -u site7-malformed -f
+journalctl -u site7-malformed-server -f
 journalctl -u site7-rebind-dns -f
+journalctl -u site7-egress-firewall
 ```
 
 ### DNS Not Resolving
@@ -230,79 +210,69 @@ journalctl -u site7-rebind-dns -f
    aws route53 list-resource-record-sets --hosted-zone-id Z3M3LMPEXAMPLE
    ```
 
-2. Check local DNS resolution:
+2. Check resolution (rebind-test is delegated via NS to ns1):
    ```bash
    dig paleon-lab-hostile.com
    dig offscope.paleon-lab-hostile.com
-   dig rebind-test.paleon-lab-hostile.com
+   dig NS rebind-test.paleon-lab-hostile.com
    ```
 
 ### Application Errors
 
 Check application logs:
 ```bash
-docker compose logs -f flask-app   # Docker
-journalctl -u paleon-site7         # Bare metal/EC2
+journalctl -u paleon-site7
 ```
 
 ### Verification Fails
 
-Run validation first:
+Run static validation first:
 ```bash
 ../validate.sh
 ```
 
-This checks for missing files, syntax errors, and configuration issues before runtime verification.
+This checks for missing files, syntax errors, stale configuration strings, and architectural drift before runtime verification.
 
 ## Cost Estimates
 
 ### Monthly AWS Costs (us-east-1)
 
-- t3.micro EC2: ~$8.50
-- Elastic IP: ~$3.60 (if not attached to running instance)
+- `t3.micro` EC2: ~$8.50
+- Elastic IP: free while attached to a running instance (charged only when idle/unattached)
 - Route53 hosted zone: $0.50/month + $0.40 per million queries
-- Data transfer: Variable based on usage
+- Data transfer: variable based on usage
 
-**Total**: Approximately $12-15/month for light test usage
+**Total**: Approximately $10-15/month for light test usage
 
 ### Cost Optimization
 
 1. **Stop when not in use**:
    ```bash
-   # Stop instance but keep EIP and DNS
    aws ec2 stop-instances --instance-ids i-xxxxxxxxxxxxxxxxx
-   
-   # Start when needed
    aws ec2 start-instances --instance-ids i-xxxxxxxxxxxxxxxxx
    ```
+   (Note: a stopped instance still incurs the idle-EIP charge.)
 
-2. **Use Spot Instances** (modify main.tf):
-   ```hcl
-   instance_market_options {
-     market_type = "spot"
-   }
-   ```
-
-3. **Destroy when finished**:
+2. **Destroy when finished**:
    ```bash
-   terraform destroy
+   terraform destroy -var-file=../terraform.tfvars
    ```
 
 ## Important Reminders
 
 > ⚠️ **THIS TARGET IS DESIGNED TO ATTEMPT TO INDUCE THE SCANNER TO LEAVE ITS TRUST BOUNDARY.**
-> 
+>
 > - Do not deploy in any VPC with connectivity to production infrastructure
 > - Do not use production AWS accounts or credentials
 > - Do not scan with production scanners without proper isolation
-> - This target is for VALIDATION ONLY - not for production use
+> - This target is for VALIDATION ONLY — not for production use
 > - Always verify isolation before scanning
 > - The reset script is safe to run repeatedly
-> - Terraform state contains no secrets - only resource IDs and configuration
+> - Terraform state contains no secrets — only resource IDs and configuration
 
 ## References
 
-- [README.md](./README.md) - Overview and test matrix
-- [ARCHITECTURE.md](./ARCHITECTURE.md) - Detailed architecture
-- [expected.yaml](./expected.yaml) - Resilience test definitions
-- [docs/](./docs/) - Detailed threat model and test specifications
+- [README.md](./README.md) — Overview and test matrix
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — Detailed architecture
+- [expected.yaml](./expected.yaml) — Resilience test definitions
+- [docs/](./docs/) — Detailed threat model and test specifications

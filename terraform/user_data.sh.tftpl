@@ -5,63 +5,110 @@
 set -euo pipefail
 
 DOMAIN_NAME="${domain_name}"
+PUBLIC_IP="${public_ip}"
 APP_DIR="/opt/paleon-site7"
 DATA_DIR="/var/lib/site7"
 LOG_FILE="/var/log/paleon-site7-bootstrap.log"
-REPO_URL="https://github.com/miftahu1/paleon-site7.git"
+REPO_URL="https://github.com/miftahu1/paleon-lab-hostile.git"
+TLS_GROUP="site7-tls"
 
 echo "=== PALEON SITE 7 BOOTSTRAP START ==="
 echo "Domain: $DOMAIN_NAME"
+echo "EIP: $PUBLIC_IP"
 echo "Starting at $(date)"
+
+if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
+    echo "[FATAL] SITE7 public EIP was not injected by Terraform"
+    exit 1
+fi
 
 # 1. System update and prerequisites
 echo "[1/12] Updating system and installing prerequisites..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >> "$LOG_FILE" 2>&1 || true
-apt-get upgrade -y >> "$LOG_FILE" 2>&1 || true
-apt-get install -y python3 python3-pip nginx certbot python3-certbot-nginx git >> "$LOG_FILE" 2>&1 || true
+apt-get update -y >> "$LOG_FILE" 2>&1
+apt-get upgrade -y >> "$LOG_FILE" 2>&1
+apt-get install -y \
+    python3 python3-pip \
+    nginx libnginx-mod-stream \
+    certbot python3-certbot-nginx \
+    git curl openssl netcat-openbsd iproute2 iptables \
+    bind9-dnsutils jq \
+    >> "$LOG_FILE" 2>&1
 
-# 2. Create system user 'site7'
-echo "[2/12] Creating system user 'site7'..."
+if [ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ]; then
+    echo "[FATAL] Nginx stream module (ngx_stream_module.so) is not installed"
+    exit 1
+fi
+
+if ! nginx -V 2>&1 | grep -Eqi 'stream'; then
+    if [ ! -e /etc/nginx/modules-enabled/50-mod-stream.conf ] && \
+       [ ! -e /etc/nginx/modules-enabled/mod-stream.conf ]; then
+        echo "[FATAL] Nginx stream module is not enabled"
+        exit 1
+    fi
+fi
+
+# Bounded journald logs
+echo "[1.1/12] Configuring journald log bounds..."
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/site7-bounds.conf << 'EOF'
+[Journal]
+SystemMaxUse=100M
+SystemKeepFree=200M
+MaxRetentionSec=1month
+RuntimeMaxUse=50M
+EOF
+systemctl restart systemd-journald
+
+# 2. Create system user 'site7' and TLS consumer group
+echo "[2/12] Creating system user 'site7' and TLS group..."
 if id -u site7 >/dev/null 2>&1; then
     echo "User site7 already exists, skipping creation"
 else
     useradd --system --shell /bin/false --home-dir "$DATA_DIR" --create-home site7
 fi
 
+if getent group "$TLS_GROUP" >/dev/null 2>&1; then
+    echo "Group $TLS_GROUP already exists"
+else
+    groupadd --system "$TLS_GROUP"
+fi
+usermod -aG "$TLS_GROUP" site7
+usermod -aG "$TLS_GROUP" www-data
+
 # 3. Create application directory structure
 echo "[3/12] Creating application directory..."
 mkdir -p "$APP_DIR"
-mkdir -p "$DATA_DIR/observations"
-mkdir -p "$DATA_DIR/rebind"
-mkdir -p "$DATA_DIR/temp"
+# DATA_DIR holds only the DNS rebinding state file (rebind-state.json).
+# Endpoint observations are kept in-memory (app.py ObservationStore, a bounded
+# deque) and exposed via /internal/site7-observation; there is no on-disk log.
+mkdir -p "$DATA_DIR"
+chown -R site7:site7 "$DATA_DIR"
+chmod 750 "$DATA_DIR"
 
 # 4. Deploy application from repository
 echo "[4/12] Cloning application repository..."
 if [ -d "$APP_DIR/.git" ]; then
     echo "Repository exists, pulling latest..."
     cd "$APP_DIR"
-    git pull origin main >> "$LOG_FILE" 2>&1 || true
+    git fetch origin main >> "$LOG_FILE" 2>&1
+    git reset --hard origin/main >> "$LOG_FILE" 2>&1
 else
     rm -rf "$APP_DIR"
-    git clone "$REPO_URL" "$APP_DIR" >> "$LOG_FILE" 2>&1 || {
-        echo "[ERROR] Failed to clone repository"
-        exit 1
-    }
+    git clone "$REPO_URL" "$APP_DIR" >> "$LOG_FILE" 2>&1
     cd "$APP_DIR"
 fi
 
-# Copy application files from repo to deployment location
 cp "$APP_DIR/app/app.py" "$APP_DIR/deployed_app.py"
 cp "$APP_DIR/app/malformed_server.py" "$APP_DIR/deployed_malformed_server.py"
 cp "$APP_DIR/app/rebind_dns_server.py" "$APP_DIR/deployed_rebind_dns_server.py"
-cp "$APP_DIR/app/requirements.txt" "$APP_DIR/deployed_requirements.txt"
+cp "$APP_DIR/requirements.txt" "$APP_DIR/deployed_requirements.txt"
 
 chown -R site7:site7 "$APP_DIR"
 
 # 5. Install Python dependencies
 echo "[5/12] Installing Python dependencies..."
-pip3 install -r "$APP_DIR/deployed_requirements.txt" --quiet >> "$LOG_FILE" 2>&1 || true
+python3 -m pip install -r "$APP_DIR/deployed_requirements.txt" --quiet --break-system-packages >> "$LOG_FILE" 2>&1
 
 # 6. Create systemd units
 echo "[6/12] Creating systemd service files..."
@@ -80,6 +127,7 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -88,24 +136,26 @@ SERVICEEOF
 cat > /etc/systemd/system/site7-malformed-server.service << 'SERVICEEOF'
 [Unit]
 Description=Site 7 Malformed Response Server
-After=network.target paleon-site7.service
+After=network.target
 
 [Service]
 Type=simple
 User=site7
 Group=site7
+SupplementaryGroups=site7-tls
 WorkingDirectory=/opt/paleon-site7
 ExecStart=/usr/bin/python3 /opt/paleon-site7/deployed_malformed_server.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
 
-cat > /etc/systemd/system/site7-rebind-dns.service << 'SERVICEEOF'
+cat > /etc/systemd/system/site7-rebind-dns.service << SERVICEEOF
 [Unit]
 Description=Site 7 DNS Rebinding Simulator
 After=network.target
@@ -120,199 +170,313 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Environment=SITE7_EIP=${public_ip}
 
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
 
 systemctl daemon-reload
+systemctl enable paleon-site7.service
+systemctl enable site7-malformed-server.service
+systemctl enable site7-rebind-dns.service
 
-# 7. Configure Nginx
-echo "[7/12] Configuring Nginx..."
-cat > /etc/nginx/sites-available/site7.conf << NGINXEOF
-server {
-    listen 80;
-    server_name $DOMAIN_NAME www.$DOMAIN_NAME;
+# 7. Certificate Provisioning
+# Certify only names that need a valid TLS handshake.
+# Do NOT request a certificate for rebind-test (would consume DNS-rebinding state).
+# Do NOT request a certificate for malformed-tls (that vhost never completes TLS).
+echo "[7/12] TLS CERTIFICATE PROVISIONING SEQUENCE"
+mkdir -p /etc/ssl/site7
+CERT_SUCCESS=false
 
-    # Malformed endpoints - proxy to raw TCP server on port 9999
-    location /hostile/malformed/chunked {
-        proxy_pass http://127.0.0.1:9999/malformed/chunked;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300;
-        proxy_connect_timeout 300;
+# Stop Nginx to release port 80 for standalone HTTP-01 (idempotent if not running)
+systemctl stop nginx 2>/dev/null || true
+
+set +e
+timeout 90s certbot certonly --standalone --non-interactive --agree-tos \
+    --email "admin@$DOMAIN_NAME" \
+    -d "$DOMAIN_NAME" \
+    -d "malformed-http.$DOMAIN_NAME" \
+    --http-01-port 80
+CERTBOT_RC=$?
+set -e
+
+if [ "$CERTBOT_RC" -eq 0 ] && [ -s "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] && [ -s "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
+    cp "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" /etc/ssl/site7/site7.crt
+    cp "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" /etc/ssl/site7/site7.key
+    CERT_SUCCESS=true
+    echo "[INFO] Certbot certificate successfully issued"
+else
+    echo "[WARN] Certbot issuance unavailable (exit $CERTBOT_RC). Generating self-signed SAN certificate fallback..."
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/site7/site7.key \
+        -out /etc/ssl/site7/site7.crt \
+        -subj "/CN=$DOMAIN_NAME/O=Paleon Site 7/C=US" \
+        -addext "subjectAltName=DNS:$DOMAIN_NAME,DNS:malformed-http.$DOMAIN_NAME,DNS:offscope.$DOMAIN_NAME,DNS:ns1.$DOMAIN_NAME"
+fi
+
+if [ ! -s /etc/ssl/site7/site7.crt ] || [ ! -s /etc/ssl/site7/site7.key ]; then
+    echo "[FATAL] Certificate files missing or zero-byte at /etc/ssl/site7/"
+    exit 1
+fi
+
+chmod 644 /etc/ssl/site7/site7.crt
+chmod 640 /etc/ssl/site7/site7.key
+chown "root:$TLS_GROUP" /etc/ssl/site7/site7.key
+chown root:root /etc/ssl/site7/site7.crt
+
+KEY_MODE=$(stat -c '%a' /etc/ssl/site7/site7.key)
+KEY_GROUP=$(stat -c '%G' /etc/ssl/site7/site7.key)
+if [ "$KEY_MODE" != "640" ] || [ "$KEY_GROUP" != "$TLS_GROUP" ]; then
+    echo "[FATAL] TLS private key permissions incorrect: mode=$KEY_MODE group=$KEY_GROUP"
+    exit 1
+fi
+if [ "$((8#$KEY_MODE % 10))" -ne 0 ]; then
+    echo "[FATAL] TLS private key is world-readable"
+    exit 1
+fi
+
+# 8. Configure Nginx
+echo "[8/12] Configuring Nginx..."
+cat > /etc/nginx/nginx.conf << 'NGINXEOF'
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+    worker_connections 768;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    gzip off;
+
+    # Internal HTTPS termination for normal traffic (SNI default backend)
+    server {
+        listen 127.0.0.1:8443 ssl;
+        server_name _;
+
+        ssl_certificate /etc/ssl/site7/site7.crt;
+        ssl_certificate_key /etc/ssl/site7/site7.key;
+
+        location / {
+            proxy_pass http://127.0.0.1:5000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 20s;
+            proxy_connect_timeout 5s;
+        }
     }
 
-    location /hostile/malformed/banner {
-        proxy_pass http://127.0.0.1:9999/malformed/banner;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300;
-        proxy_connect_timeout 300;
+    # Public Port 80 (Redirect)
+    server {
+        listen 80 default_server;
+        server_name _;
+
+        location / {
+            return 301 https://$host$request_uri;
+        }
+    }
+}
+
+# Stream layer for SNI routing on port 443.
+# malformed-http is NOT HTTP-proxied: Nginx forwards raw TCP after ssl_preread.
+# malformed-tls is NOT converted to HTTP: raw TCP to the malformed TLS backend.
+stream {
+    map $ssl_preread_server_name $backend_name {
+        ~^malformed-tls\.    127.0.0.1:9998;
+        ~^malformed-http\.   127.0.0.1:9999;
+        default              127.0.0.1:8443;
     }
 
-    location /hostile/malformed/tls {
-        # TLS malformed requires separate TLS listener - not proxied
-        proxy_pass http://127.0.0.1:5000/hostile/malformed/tls;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300;
-        proxy_connect_timeout 300;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300;
-        proxy_connect_timeout 300;
+    server {
+        listen 443;
+        ssl_preread on;
+        proxy_pass $backend_name;
+        proxy_timeout 20s;
+        proxy_connect_timeout 5s;
     }
 }
 NGINXEOF
 
-cat > /etc/nginx/sites-available/offscope.conf << NGINXEOF
-server {
-    listen 80;
-    server_name offscope.$DOMAIN_NAME;
+if ! nginx -t; then
+    echo "[FATAL] Nginx configuration test failed after certificate setup"
+    exit 1
+fi
 
-    location / {
-        return 200 "Off-scope target - no content served here\n";
-        add_header Content-Type text/plain;
-    }
-}
-NGINXEOF
-
-ln -sf /etc/nginx/sites-available/site7.conf /etc/nginx/sites-enabled/site7.conf
-ln -sf /etc/nginx/sites-available/offscope.conf /etc/nginx/sites-enabled/offscope.conf
-rm -f /etc/nginx/sites-enabled/default
-
-# 8. Start application services
-echo "[8/12] Starting application services..."
-systemctl daemon-reload
+# 9. Start application services
+echo "[9/12] Starting application services..."
 systemctl stop paleon-site7.service 2>/dev/null || true
 systemctl stop site7-malformed-server.service 2>/dev/null || true
 systemctl stop site7-rebind-dns.service 2>/dev/null || true
-systemctl start site7-rebind-dns.service 2>/dev/null || true
-systemctl start site7-malformed-server.service 2>/dev/null || true
-systemctl start paleon-site7.service 2>/dev/null || true
 
-# 9. Start Nginx
-echo "[9/12] Starting Nginx..."
-systemctl stop nginx 2>/dev/null || true
+systemctl start site7-rebind-dns.service
+systemctl start site7-malformed-server.service
+systemctl start paleon-site7.service
+
+# 10. Start Nginx
+echo "[10/12] Starting Nginx..."
 systemctl start nginx
+systemctl enable nginx
 
 # Wait for services to stabilize
-sleep 2
+sleep 3
 
-# 10. Validate services
-echo "[10/12] Validating services..."
-ERRORS=0
+# Host firewall: block application-user egress to private/link-local destinations.
+# Persistent across reboot via a systemd oneshot ordered before networking, so the
+# unprivileged 'site7' user can never reach RFC1918 / link-local / ULA ranges even
+# after a reboot. DNS replies to public clients remain allowed (the reply's
+# destination is the querier, not a private range). This is defense-in-depth: the
+# application code performs no outbound connections in the first place.
+echo "[10.1/12] Installing persistent site7 egress restrictions..."
+cat > /usr/local/sbin/site7-egress-firewall.sh << 'FWEOF'
+#!/usr/bin/env bash
+# PALEON SITE 7 — egress isolation for the unprivileged 'site7' user.
+# Idempotent: -C checks existence before -I inserts, so it is safe to run on
+# every boot and re-run during bootstrap without duplicating rules.
+set -euo pipefail
 
-# Check Flask app
-if curl -s --max-time 5 http://localhost:5000/ >/dev/null 2>&1; then
-    echo "[PASS] Flask app responding on port 5000"
-else
-    echo "[WARN] Flask app not responding on port 5000, attempting restart..."
-    systemctl restart paleon-site7.service 2>/dev/null || true
-    sleep 3
-fi
+apply() {
+    # apply <iptables|ip6tables> <rule-spec...> : insert an OUTPUT REJECT rule
+    # only if an identical rule is not already present.
+    local bin="$1"; shift
+    "$bin" -C OUTPUT "$@" 2>/dev/null || "$bin" -I OUTPUT "$@"
+}
 
-# Check Nginx
-if curl -s --max-time 5 http://localhost/ >/dev/null 2>&1; then
-    echo "[PASS] Nginx responding on port 80"
-else
-    echo "[WARN] Nginx not responding, checking configuration..."
-    nginx -t 2>&1 || true
-fi
+apply iptables  -m owner --uid-owner site7 -d 169.254.0.0/16 -j REJECT
+apply iptables  -m owner --uid-owner site7 -d 10.0.0.0/8     -j REJECT
+apply iptables  -m owner --uid-owner site7 -d 172.16.0.0/12  -j REJECT
+apply iptables  -m owner --uid-owner site7 -d 192.168.0.0/16 -j REJECT
+apply ip6tables -m owner --uid-owner site7 -d fc00::/7       -j REJECT
+apply ip6tables -m owner --uid-owner site7 -d fe80::/10      -j REJECT
+FWEOF
+chmod 755 /usr/local/sbin/site7-egress-firewall.sh
 
-# Check malformed server (should be on port 9999)
-if ss -tlnp | grep -q ":9999 "; then
-    echo "[PASS] Malformed server listening on port 9999"
-else
-    echo "[WARN] Malformed server not listening on port 9999"
-fi
+cat > /etc/systemd/system/site7-egress-firewall.service << 'FWUNITEOF'
+[Unit]
+Description=Site 7 egress isolation firewall (site7 user -> private/link-local REJECT)
+Documentation=https://github.com/miftahu1/paleon-lab-hostile
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target
+Conflicts=shutdown.target
+Before=shutdown.target
 
-# Check DNS server (should be on port 53)
-if ss -ulnp | grep -q ":53 "; then
-    echo "[PASS] DNS rebinding server listening on UDP port 53"
-else
-    echo "[WARN] DNS rebinding server not listening on UDP port 53"
-fi
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/site7-egress-firewall.sh
 
-# 11. Validate all endpoints
-echo "[11/12] Validating all endpoints..."
-ENDPOINTS=(
-    "/"
-    "/hostile/ssrf/fargate"
-    "/hostile/ssrf/fargate-relative"
-    "/hostile/ssrf/imds"
-    "/hostile/ssrf/rfc1918"
-    "/hostile/ssrf/localhost"
-    "/hostile/ssrf/ipv6-loopback"
-    "/hostile/ssrf/ipv6-private"
-    "/hostile/scope-escape"
-    "/hostile/redirect-loop/a"
-    "/hostile/redirect-loop/b"
-    "/hostile/redirect-loop/c"
-    "/hostile/self-loop"
-    "/hostile/large-body"
-    "/hostile/slow-body"
-    "/hostile/gzip-bomb"
-    "/hostile/malformed/chunked"
-    "/hostile/malformed/tls"
-    "/hostile/malformed/banner"
-    "/hostile/rebind"
-    "/hostile/read-only"
-    "/hostile/kill-test"
-    "/internal/site7-observation"
-)
-for ep in "${ENDPOINTS[@]}"; do
-    if curl -s -I --max-time 5 "http://localhost$ep" 2>/dev/null | head -1 | grep -q "HTTP/"; then
-        echo "[PASS] Endpoint $ep responding"
-    else
-        echo "[FAIL] Endpoint $ep not responding"
-        ERRORS=$((ERRORS + 1))
+[Install]
+WantedBy=multi-user.target
+FWUNITEOF
+
+systemctl daemon-reload
+systemctl enable site7-egress-firewall.service
+systemctl start site7-egress-firewall.service
+
+# 11. Hardened Bootstrap Health Gate
+echo "[11/12] === RUNNING HARDENED HEALTH GATE ==="
+HEALTH_ERRORS=0
+
+for svc in paleon-site7 site7-malformed-server site7-rebind-dns nginx; do
+    if ! systemctl is-active --quiet "$svc"; then
+        echo "[FATAL] Service '$svc' is NOT active"
+        HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+    fi
+    if systemctl is-failed --quiet "$svc"; then
+        echo "[FATAL] Service '$svc' is in failed state"
+        HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+    fi
+    RESTARTS=$(systemctl show "$svc" -p NRestarts --value)
+    if [ -n "$RESTARTS" ] && [ "$RESTARTS" -gt 5 ]; then
+        echo "[FATAL] Service '$svc' is crash-looping (NRestarts=$RESTARTS)"
+        HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
     fi
 done
 
-# 12. Enable HTTPS with certbot (if DNS is configured)
-echo "[12/12] Attempting HTTPS setup..."
-if host "$DOMAIN_NAME" >/dev/null 2>&1; then
-    echo "DNS is configured, attempting certbot..."
-    certbot --nginx -d "$DOMAIN_NAME" -d "www.$DOMAIN_NAME" --non-interactive --agree-tos --email "admin@$DOMAIN_NAME" 2>/dev/null || {
-        echo "[WARN] Certbot failed - DNS may not be pointed to this server"
-    }
-else
-    echo "[SKIP] DNS not configured for $DOMAIN_NAME"
+if ! ss -tlnp | grep -qE '127\.0\.0\.1:5000\b|:5000\s'; then
+    echo "[FATAL] TCP 5000 (Flask localhost) is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -tlnp | grep -q '127.0.0.1:8443'; then
+    echo "[FATAL] TCP 8443 (internal HTTPS) is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -tlnp | grep -q '127.0.0.1:9998'; then
+    echo "[FATAL] TCP 9998 (malformed TLS) is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -tlnp | grep -q '127.0.0.1:9999'; then
+    echo "[FATAL] TCP 9999 (malformed HTTP) is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -tlnp | grep -qE ':80\b'; then
+    echo "[FATAL] TCP 80 is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -tlnp | grep -qE ':443\b'; then
+    echo "[FATAL] TCP 443 is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -tlnp | grep -qE ':53\b'; then
+    echo "[FATAL] TCP 53 is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! ss -ulnp | grep -qE ':53\b'; then
+    echo "[FATAL] UDP 53 is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
 fi
 
-# Final status
-echo
-echo "=== SERVICE STATUS ==="
-systemctl is-active paleon-site7.service 2>/dev/null || echo "paleon-site7: inactive"
-systemctl is-active site7-malformed-server.service 2>/dev/null || echo "site7-malformed-server: inactive"
-systemctl is-active site7-rebind-dns.service 2>/dev/null || echo "site7-rebind-dns: inactive"
-systemctl is-active nginx 2>/dev/null || echo "nginx: inactive"
-echo
-echo "=== LISTENING PORTS ==="
-ss -tlnp 2>/dev/null | grep -E ":(5000|9999|80|443) " || echo "No expected ports listening"
-ss -ulnp 2>/dev/null | grep -E ":53 " || echo "No expected UDP ports listening"
-echo
-echo "=== BOOTSTRAP COMPLETE ==="
-echo "Finished at $(date)"
-echo "Errors: $ERRORS"
-if [ $ERRORS -gt 0 ]; then
-    echo "WARNING: $ERRORS endpoint(s) failed validation"
-    exit 1
-else
-    echo "All endpoints validated successfully"
-    exit 0
+if ! curl -sf --max-time 5 http://127.0.0.1:5000/health >/dev/null; then
+    echo "[FATAL] Flask app health check failed"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
 fi
+
+if ! nc -z -w 3 127.0.0.1 9998 || ! nc -z -w 3 127.0.0.1 9999; then
+    echo "[FATAL] Hostile raw backends (9998/9999) unreachable"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+
+if ! nc -z -u -w 3 127.0.0.1 53; then
+    echo "[FATAL] DNS UDP 53 unreachable"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+
+if ! nginx -t; then
+    echo "[FATAL] nginx -t failed at health gate"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+
+# Confirm site7 can read the TLS key (malformed HTTP backend)
+if ! sudo -u site7 test -r /etc/ssl/site7/site7.key; then
+    echo "[FATAL] site7 cannot read TLS private key"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+if ! sudo -u www-data test -r /etc/ssl/site7/site7.key; then
+    echo "[FATAL] www-data cannot read TLS private key"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
+
+if [ "$HEALTH_ERRORS" -gt 0 ]; then
+    echo "=== BOOTSTRAP FAILED: $HEALTH_ERRORS CHECKS FAILED ==="
+    exit 1
+fi
+echo "=== BOOTSTRAP COMPLETE: ALL SERVICES VERIFIED HEALTHY ==="
+
+# 12. Final status
+echo "[12/12] Bootstrap complete at $(date)"

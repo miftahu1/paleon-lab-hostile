@@ -32,7 +32,7 @@ GET /hostile/large-body?size_mb=N
 ### Parameters
 | Parameter | Default | Min | Max | Description |
 |-----------|---------|-----|-----|-------------|
-| `size_mb` | 10 | 1 | 50 | Response size in megabytes |
+| `size_mb` | 10 | 1 | 20 | Response size in megabytes |
 
 ### Implementation
 
@@ -55,11 +55,11 @@ def generate_large_body(size_bytes: int, chunk_size: int = 65536) -> Generator[b
 ### Server-Side Ceilings
 
 ```python
-MAX_BODY_SIZE = 50 * 1024 * 1024  # 50 MB absolute maximum
-size_mb = max(1, min(size_mb, 50))  # Clamped in endpoint
+MAX_BODY_SIZE = 20 * 1024 * 1024  # 20 MB absolute maximum
+size_mb = max(1, min(size_mb, MAX_BODY_SIZE // (1024 * 1024)))  # Clamped in endpoint
 ```
 
-Even if attacker sends `size_mb=1000`, server clamps to 50MB.
+Even if attacker sends `size_mb=1000`, server clamps to 20MB.
 
 ### Expected Scanner Behavior
 
@@ -70,7 +70,7 @@ Even if attacker sends `size_mb=1000`, server clamps to 50MB.
 | Streams without loading full body | ✅ PASS |
 | OOM crash | ❌ FAIL |
 | Hangs reading unbounded stream | ❌ FAIL |
-| Stores full 50MB in RAM | ❌ FAIL (inefficient) |
+| Stores full 20MB in RAM | ❌ FAIL (inefficient) |
 
 ### Evidence to Collect
 - Scanner's configured body size limit
@@ -93,7 +93,7 @@ GET /hostile/slow-body?delay_ms=N
 ### Parameters
 | Parameter | Default | Min | Max | Description |
 |-----------|---------|-----|-----|-------------|
-| `delay_ms` | 5000 | 100 | 30000 | Total delay in milliseconds |
+| `delay_ms` | 5000 | 100 | 15000 | Total delay in milliseconds |
 
 ### Implementation
 
@@ -117,7 +117,7 @@ def generate_slow_body(delay_ms: int, chunks: int = 10) -> Generator[bytes, None
 ### Server-Side Ceilings
 
 ```python
-MAX_DELAY = 30000  # 30 seconds absolute maximum
+MAX_DELAY = 15000  # 15 seconds absolute maximum
 delay_ms = max(100, min(delay_ms, MAX_DELAY))  # Clamped in endpoint
 ```
 
@@ -153,35 +153,40 @@ GET /hostile/gzip-bomb
 ### Implementation
 
 ```python
-def generate_gzip_bomb(decompressed_size: int = 10 * 1024 * 1024) -> bytes:
-    """Generate a gzip-compressed payload that decompresses to ~10MB."""
-    # Highly compressible data: all zeros
-    data = b"\x00" * decompressed_size
-
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=9) as gz:
-        for i in range(0, len(data), 1024*1024):  # 1MB chunks
-            gz.write(data[i:i+1024*1024])
-
-    return buf.getvalue()
+def generate_gzip_bomb_stream(
+    decompressed_size: int = MAX_GZIP_DECOMPRESSED,   # 10 MB
+    input_chunk: int = 64 * 1024,
+) -> Generator[bytes, None, None]:
+    """Stream a valid gzip member that decompresses to decompressed_size."""
+    size = min(decompressed_size, MAX_GZIP_DECOMPRESSED)
+    compressor = zlib.compressobj(level=9, wbits=31)  # wbits=31 => gzip framing
+    remaining = size
+    zeros = b"\x00" * input_chunk
+    while remaining > 0:
+        n = min(input_chunk, remaining)
+        block = zeros if n == input_chunk else b"\x00" * n
+        out = compressor.compress(block)
+        remaining -= n
+        if out:
+            yield out
+    tail = compressor.flush()
+    if tail:
+        yield tail
 ```
 
 **Key properties**:
-- ~20KB compressed → ~10MB decompressed (500:1 ratio)
-- Generated at module load time (cached)
+- ~10KB compressed → ~10MB decompressed (~1000:1 ratio)
+- Streamed per request with `zlib.compressobj(level=9, wbits=31)`; the 10 MB of zeros is never buffered in RAM
 - `Content-Encoding: gzip` header
-- `Content-Length: <compressed_size>`
+- No `Content-Length` (response is streamed)
 - `X-Decompressed-Size: 10485760` header (for verification)
 
 ### Server-Side Ceilings
 
 ```python
-compressed_data = generate_gzip_bomb(decompressed_size)
-compressed_size = len(compressed_data)
-
-# Sanity ceiling: if compressed > 100KB, something is wrong
-if compressed_size > 100 * 1024:
-    return jsonify({"error": "Compressed size exceeds ceiling"}), 500
+decompressed_size = MAX_GZIP_DECOMPRESSED  # 10 MB — the only ceiling
+# generate_gzip_bomb_stream() clamps its argument to MAX_GZIP_DECOMPRESSED
+# and streams the gzip member, so the decompressed payload can never exceed 10 MB.
 ```
 
 ### Expected Scanner Behavior
@@ -209,12 +214,12 @@ if compressed_size > 100 * 1024:
 
 | Resource | Limit | Enforcement |
 |----------|-------|-------------|
-| Response body size | 50 MB | Clamped in endpoint |
-| Response duration | 30 s | Clamped in endpoint |
-| Compressed payload | 100 KB | Hard ceiling check |
+| Response body size | 20 MB | Clamped in endpoint |
+| Response duration | 15 s | Clamped in endpoint |
+| Compressed gzip output | ~10 KB | Streamed (no Content-Length) |
 | Decompressed size | 10 MB (test) | Documented in header |
-| Concurrent connections | Unlimited (Gunicorn workers) | Nginx limits |
-| Worker memory | ~50 MB per worker | Process isolation |
+| Concurrent connections | Bounded by Nginx + threaded Flask | Nginx stream/http limits |
+| Peak response memory | ~64 KB (largest stream chunk) | Generators never buffer full body |
 
 ### Client-Side (Scanner) Expected Limits
 
@@ -284,22 +289,22 @@ gzip -dc /tmp/bomb.gz | wc -c  # Should be ~10MB
 |---------|-------------|------------|----------------|
 | 1 | No | 64KB | 1,048,576 |
 | 10 (default) | No | 64KB | 10,485,760 |
-| 50 (max) | No | 64KB | 52,428,800 |
+| 20 (max) | No | 64KB | 20,971,520 |
 
 ### Slow Body
 | delay_ms | Chunks | Chunk Size | Total Data | Delay/Chunk |
 |----------|--------|------------|------------|-------------|
 | 100 (min) | 10 | 1KB | 10KB | 10ms |
 | 5000 (default) | 10 | 1KB | 10KB | 500ms |
-| 30000 (max) | 10 | 1KB | 10KB | 3000ms |
+| 15000 (max) | 10 | 1KB | 10KB | 1500ms |
 
 ### Gzip Bomb
 | Metric | Value |
 |--------|-------|
-| Compressed size | ~20 KB |
+| Compressed size | ~10 KB (streamed; not sent as a `Content-Length`) |
 | Decompressed size | 10,485,760 bytes (10 MB) |
-| Compression ratio | ~500:1 |
-| Generation time | ~100ms (cached after first) |
+| Compression ratio | ~1000:1 |
+| Generation | Regenerated on every request (streamed on the fly; not cached) |
 
 ---
 

@@ -1,4 +1,0 @@
-# PALEON SITE 7 — Python Dependencies
-# Single source of truth - keep in sync with root requirements.txt
-flask>=2.3.0,<4.0.0
-gunicorn>=21.0.0,<23.0.0

@@ -50,7 +50,7 @@ variable "offscope_hostname" {
 }
 
 variable "rebind_hostname" {
-  description = "DNS-rebinding test hostname (initial A record points to a public test IP)."
+  description = "DNS-rebinding test hostname delegated via NS to ns1 (authoritative daemon on the instance)."
   type        = string
   default     = "rebind-test.paleon-lab-hostile.com"
 }

@@ -6,14 +6,16 @@
 
 ## What Site 7 Is
 
-Site 7 is a **hostile test target** designed to validate the safety boundaries of the Paleon scanner runtime. It is a deliberately adversarial web application that attempts to induce the scanner to violate its trust boundaries through a variety of attack vectors including SSRF, scope escape, redirect loops, resource exhaustion, and malformed protocol handling.
+Site 7 is a **hostile test target** designed to validate the safety boundaries of the Paleon scanner runtime. It is a deliberately adversarial web application that attempts to induce the scanner to violate its trust boundaries through a variety of stimuli including SSRF redirect bait, scope escape, redirect loops, resource exhaustion, malformed HTTP/TLS, and DNS rebinding.
+
+The target only **emits** hostile stimuli (redirect `Location` headers, oversized/slow/compressed bodies, malformed protocol bytes, and rebinding DNS answers). It never performs outbound requests, never authenticates, never touches credentials, and never reaches any real internal asset. Everything a scanner might be tempted to follow is bait that the target itself refuses to touch.
 
 ## Why It Exists
 
 The Paleon scanner must operate against arbitrary customer-controlled content. This target exists to:
 
 1. **Validate scanner safety boundaries** — Confirm the scanner cannot be induced to access internal networks, credentials, or production infrastructure
-2. **Test defensive mechanisms** — Verify rate limiting, connection timeouts, body size limits, and protocol parsing resilience
+2. **Test defensive mechanisms** — Verify connection timeouts, body-size limits, decompression limits, and protocol-parsing resilience
 3. **Provide regression coverage** — Ensure fixes for boundary violations do not regress
 4. **Demonstrate isolation** — Prove the target itself cannot reach real internal assets
 
@@ -21,25 +23,45 @@ The Paleon scanner must operate against arbitrary customer-controlled content. T
 
 | Test Category | Test IDs | Description |
 |---------------|----------|-------------|
-| **SSRF (Server-Side Request Forgery)** | SSRF-001 through SSRF-006 | Attempts to induce scanner to make requests to internal metadata services, private IP ranges, localhost, and IPv6 private addresses |
-| **Scope Escape** | SAFE-001 | Attempts to escape the scanner's allowed scope via redirects to off-scope host |
-| **Redirect Loops** | SAFE-002 | Multi-step redirect chain to test loop detection |
-| **Resource Exhaustion** | SAFE-003 | Large response bodies, slow streaming, gzip bombs |
-| **Malformed Protocols** | SAFE-004 | Malformed chunked encoding, invalid HTTP status codes |
-| **Passive Safety** | SAFE-005 | Read-only endpoint rejecting state-changing methods |
-| **Termination Safety** | SAFE-006 | Clean termination on scan kill |
-| **DNS Rebinding** | SAFE-007 | DNS rebinding attack simulation with TTL=0 |
+| **SSRF (Server-Side Request Forgery)** | SSRF-001 through SSRF-004 | Redirect bait toward cloud metadata services, RFC1918 ranges, localhost, and IPv6 loopback/ULA |
+| **Scope Escape** | SAFE-001 | Redirect to an off-scope host |
+| **Redirect Loops** | SAFE-002 | Three-cycle redirect chain (`a → b → c → a`) plus a self-loop |
+| **Resource Exhaustion** | SAFE-003 | Large streamed body, slow drip body, gzip bomb |
+| **Malformed HTTP** | SAFE-004 | Invalid chunked encoding and control-byte / length-mismatch headers, over real TLS |
+| **Malformed TLS** | SAFE-004-TLS | Garbled TLS ServerHello that never completes a handshake |
+| **Passive Safety** | SAFE-005 | Read-only observer endpoint that records the method used |
+| **Termination Safety** | SAFE-006 | Connection held open for 15 s to test clean scan termination |
+| **DNS Rebinding** | SAFE-007 | First DNS answer public, subsequent answers private, TTL=0 |
+
+## Architecture at a Glance
+
+| Layer | Detail |
+|-------|--------|
+| **Compute** | Single EC2 instance, Ubuntu 24.04 LTS, default VPC, `t3.micro` (configurable), IMDSv2 required, **no IAM instance profile** |
+| **Public ports** | 22 (admin CIDR only), 53 TCP+UDP, 80, 443 |
+| **Port 80** | `301` redirect to HTTPS |
+| **Port 443** | Nginx `stream` + `ssl_preread` SNI dispatch (see below) |
+| **Internal (localhost only)** | Flask `127.0.0.1:5000`, Nginx HTTPS termination `127.0.0.1:8443`, malformed TLS `127.0.0.1:9998`, malformed HTTP `127.0.0.1:9999` |
+| **DNS** | Authoritative daemon on `:53` for `rebind-test.paleon-lab-hostile.com`, delegated by an `NS` record to `ns1.paleon-lab-hostile.com` (→ the instance EIP) |
+| **Observations** | In-memory, bounded `deque(maxlen=100)`; read at `/internal/site7-observation` (localhost only). No on-disk observation logs. |
+
+SNI routing on 443:
+
+| SNI hostname | Backend | Behavior |
+|--------------|---------|----------|
+| `malformed-tls.paleon-lab-hostile.com` | `127.0.0.1:9998` | Raw TCP; emits a garbled ServerHello; TLS never completes |
+| `malformed-http.paleon-lab-hostile.com` | `127.0.0.1:9999` | Completes a real TLS handshake, then emits malformed HTTP |
+| anything else (default) | `127.0.0.1:8443` → Flask `5000` | Normal HTTPS termination to the Flask app |
 
 ## How It Is Isolated
 
-**Site 7 runs on a dedicated, isolated instance with:**
+**Site 7 runs on a standalone, minimally-privileged instance with:**
 
-- **No shared infrastructure** — Separate VM/container from any production or staging systems
-- **No production connectivity** — Security groups deny all outbound traffic to private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16) and cloud metadata endpoints (169.254.169.254, 169.254.170.2)
-- **Dedicated network interface** — Isolated VPC/subnet with no peering to production VPCs
-- **No shared secrets** — No AWS credentials, database passwords, API keys, or service account tokens mounted
-- **Localhost-only access paths** — Malformed server (port 5001), DNS rebind HTTP (port 5002), and DNS rebind UDP (port 8053) only reachable via SSRF redirect chain
-- **Reverse proxy termination** — Nginx terminates TLS and proxies to Flask app (port 5000); Flask app not directly exposed
+- **No shared infrastructure** — Dedicated EC2 instance, no shared resources with other Paleon sites
+- **No AWS credentials** — No IAM instance profile is attached, and IMDSv2 is required, so no role credentials exist to steal
+- **On-host egress isolation** — The unprivileged `site7` service user is blocked by host `iptables`/`ip6tables` owner rules from reaching RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), and IPv6 ULA/link-local (`fc00::/7`, `fe80::/10`). These rules are reinstalled on every boot by a `systemd` oneshot ordered before networking, so the isolation **persists across reboot**.
+- **Application makes no outbound calls** — Defense in depth: the app code never opens an outbound socket. SSRF vectors are `Location` headers only; the target never follows them.
+- **Localhost-only backends** — Flask (5000), Nginx termination (8443), and the malformed servers (9998/9999) bind `127.0.0.1` and are reachable only through the Nginx SNI router on 443.
 
 > ⚠️ **CRITICAL WARNING**
 >
@@ -47,143 +69,142 @@ The Paleon scanner must operate against arbitrary customer-controlled content. T
 >
 > Do not scan this target with production scanners. Do not deploy this target in any environment that has connectivity to production infrastructure. Do not reuse components from this target in production code.
 
-## How to Validate Locally
+## How to Run Locally
+
+There is no container stack; the application is three plain Python services fronted by Nginx. For a quick local check of the Flask app alone:
 
 ```bash
-# Start the full stack (requires Docker Compose)
-cd C:/Users/mifta/Desktop/Paleon/Test Sites/hostile
-docker compose up -d
+cd paleon-lab-hostile
+python3 -m pip install -r requirements.txt
+python3 app/app.py   # binds 127.0.0.1:5000
+```
 
-# Verify services are healthy
-docker compose ps
+The malformed server and DNS server require a TLS key pair and privileged port 53 respectively, and are intended to run under `systemd` on the deployed instance (see [DEPLOYMENT.md](DEPLOYMENT.md)). To statically validate the repository without any host:
 
-# Run local scanner against the target
-# (Use your scanner's local test mode pointed at https://localhost)
-
-# Check logs for expected test behaviors
-docker compose logs -f flask-app
-docker compose logs -f malformed-server
-docker compose logs -f dns-rebind-server
+```bash
+./validate.sh
 ```
 
 ## How to Reset
 
+On the deployed instance, `reset.sh` restarts the services and restores the DNS-rebinding state to its initial (public-first) condition. In-memory observations are discarded automatically when the Flask service restarts.
+
 ```bash
-# Full reset — stops containers, removes volumes, rebuilds
-docker compose down -v
-docker compose build --no-cache
-docker compose up -d
-
-# Soft reset — restarts services only
-docker compose restart
-
-# Or use the provided reset script
-./reset.sh
+sudo ./reset.sh
 ```
 
 ## How to Deploy
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for full deployment instructions including:
 - Terraform initialization and apply
-- DNS verification
+- DNS delegation verification
 - Certificate provisioning
 - Service verification
 - Rollback procedures
 
 ## How to Verify
 
-After deployment, verify each test endpoint responds as expected:
+After deployment, verify each test endpoint responds as expected. Inspect redirect `Location` headers — **do not follow them.** Replace `<eip>` with the instance Elastic IP.
 
 ```bash
-# SSRF tests (inspect Location headers - DO NOT FOLLOW)
-curl -I http://site7.paleon-lab-hostile.com/hostile/ssrf/fargate
-curl -I http://site7.paleon-lab-hostile.com/hostile/ssrf/imds
-curl -I http://site7.paleon-lab-hostile.com/hostile/ssrf/rfc1918
-curl -I http://site7.paleon-lab-hostile.com/hostile/ssrf/localhost
-curl -I http://site7.paleon-lab-hostile.com/hostile/ssrf/ipv6-loopback
-curl -I http://site7.paleon-lab-hostile.com/hostile/ssrf/ipv6-private
+# SSRF redirect bait (inspect Location headers - DO NOT FOLLOW)
+curl -sI https://paleon-lab-hostile.com/hostile/ssrf/fargate
+curl -sI https://paleon-lab-hostile.com/hostile/ssrf/fargate-relative
+curl -sI https://paleon-lab-hostile.com/hostile/ssrf/imds
+curl -sI "https://paleon-lab-hostile.com/hostile/ssrf/rfc1918?target=10"
+curl -sI https://paleon-lab-hostile.com/hostile/ssrf/localhost
+curl -sI https://paleon-lab-hostile.com/hostile/ssrf/ipv6-loopback
+curl -sI https://paleon-lab-hostile.com/hostile/ssrf/ipv6-private
 
-# Scope escape test
-curl -I http://site7.paleon-lab-hostile.com/hostile/scope-escape
+# Scope escape
+curl -sI https://paleon-lab-hostile.com/hostile/scope-escape
 
-# Redirect loop test
-curl -I http://site7.paleon-lab-hostile.com/hostile/redirect-loop
+# Redirect loop (3-cycle) and self-loop
+curl -sI https://paleon-lab-hostile.com/hostile/redirect-loop
+curl -sI https://paleon-lab-hostile.com/hostile/self-loop
 
-# Resource exhaustion tests
-curl -I http://site7.paleon-lab-hostile.com/hostile/large-body
-curl --max-time 10 http://site7.paleon-lab-hostile.com/hostile/slow-body
-curl -I http://site7.paleon-lab-hostile.com/hostile/gzip-bomb
+# Resource exhaustion
+curl -sI "https://paleon-lab-hostile.com/hostile/large-body?size_mb=10"
+curl -s --max-time 10 "https://paleon-lab-hostile.com/hostile/slow-body?delay_ms=5000" -o /dev/null
+curl -sI https://paleon-lab-hostile.com/hostile/gzip-bomb
 
-# Malformed protocol tests
-curl -I http://site7.paleon-lab-hostile.com/hostile/malformed/chunked
-curl -I http://site7.paleon-lab-hostile.com/hostile/malformed/banner
+# Malformed HTTP (over real TLS, via SNI subdomain) — raw bytes, do not parse as HTTP
+curl -sk --resolve malformed-http.paleon-lab-hostile.com:443:<eip> \
+     https://malformed-http.paleon-lab-hostile.com/malformed/chunked
+curl -sk --resolve malformed-http.paleon-lab-hostile.com:443:<eip> \
+     https://malformed-http.paleon-lab-hostile.com/malformed/banner
 
-# Passive safety test
-curl http://site7.paleon-lab-hostile.com/hostile/read-only
-curl -X POST http://site7.paleon-lab-hostile.com/hostile/read-only  # Should return 405
+# Malformed TLS (handshake never completes) — expect a TLS error, not a page
+openssl s_client -connect <eip>:443 -servername malformed-tls.paleon-lab-hostile.com </dev/null
 
-# DNS rebinding test
-dig @<public-ip> -p 8053 rebind-test.paleon-lab-hostile.com
-dig @<public-ip> -p 8053 rebind-test.paleon-lab-hostile.com  # Should return different IP
+# Passive safety (returns 200 and records the method used)
+curl -s  https://paleon-lab-hostile.com/hostile/read-only
+curl -sX POST https://paleon-lab-hostile.com/hostile/read-only
+
+# DNS rebinding (delegated zone; first answer public, second answer private, TTL=0)
+dig @<eip> rebind-test.paleon-lab-hostile.com A +short
+dig @<eip> rebind-test.paleon-lab-hostile.com A +short   # subsequent answer -> 192.168.1.1
 ```
+
+For an automated public-boundary check against a live instance, run `test_all_endpoints.py <eip>`.
 
 ## What NOT To Do
 
 | Action | Reason |
 |--------|--------|
-| Deploy to production VPC | Target attempts SSRF to metadata services |
-| Share infrastructure with production | Noisy neighbor risk; isolation violation |
-| Mount production credentials | Target is designed to extract them via SSRF |
-| Scan with production scanner without isolation | Scanner may be induced to scan internal assets |
-| Modify security groups to allow outbound | Defeats the isolation model |
-| Run malformed server on 0.0.0.0 with external access | Exposes protocol fuzzing to network |
-| Disable Nginx rate limits | Removes protection against resource exhaustion |
-| Follow SSRF redirect Location headers | Would connect to internal/metadata endpoints |
+| Deploy to a production VPC | Target emits SSRF bait toward metadata services |
+| Share infrastructure with production | Noisy-neighbor risk; isolation violation |
+| Mount production credentials | The target is bait; credentials must never be reachable |
+| Scan with a production scanner without isolation | Scanner may be induced to scan internal assets |
+| Attach an IAM instance profile | Would give the instance stealable role credentials |
+| Weaken host egress rules or SG | Defeats the isolation model |
+| Bind the malformed/DNS servers to `0.0.0.0` beyond port 53 | Exposes protocol fuzzing to the network |
+| Follow SSRF redirect `Location` headers | Would connect to internal/metadata endpoints |
 
 ## Pass/Fail Criteria
 
 | Criterion | Pass | Fail |
 |-----------|------|------|
-| **SSRF-001** Fargate metadata access | Scanner blocks/times out; no response from 169.254.170.2 | Scanner returns metadata content |
-| **SSRF-002** EC2 IMDS access | Scanner blocks connection to 169.254.169.254 | Scanner returns metadata content |
-| **SSRF-003** Private IP access | Scanner blocks connection to RFC1918 addresses | Scanner returns content from private IP |
-| **SSRF-004** Localhost access (IPv4) | Scanner blocks connection to 127.0.0.1 | Scanner returns content from localhost |
-| **SSRF-004** IPv6 loopback access | Scanner blocks connection to [::1] | Scanner returns content from IPv6 loopback |
-| **SSRF-004** IPv6 ULA access | Scanner blocks connection to fc00::/7 | Scanner returns content from IPv6 ULA |
-| **SAFE-001** Scope escape | Scanner enforces scope; doesn't follow off-scope redirect | Scanner follows redirect to offscope.paleon-lab-hostile.com |
-| **SAFE-002** Redirect loop | Scanner detects loop within configured max hops | Scanner loops indefinitely or crashes |
-| **SAFE-003** Large body | Scanner enforces body size limit; streams or truncates | Scanner OOMs or stores unbounded body |
-| **SAFE-003** Slow body | Scanner enforces read timeout; cancels slow stream | Scanner hangs indefinitely |
-| **SAFE-003** Gzip bomb | Scanner enforces decompression size limit | Scanner decompresses fully; OOM or disk exhaustion |
-| **SAFE-004** Malformed chunked | Scanner rejects malformed chunked gracefully | Scanner crashes, hangs, or accepts invalid encoding |
-| **SAFE-004** Malformed banner | Scanner rejects invalid status code gracefully | Scanner crashes, hangs, or accepts invalid status |
-| **SAFE-005** Passive safety | Scanner only uses GET; no state-changing requests | Scanner sends POST/PUT/DELETE to read-only endpoint |
-| **SAFE-006** Termination safety | Scanner handles SIGTERM cleanly; no orphan processes | Scanner leaves orphan processes on kill |
-| **SAFE-007** DNS rebinding | Scanner re-validates DNS on reconnect; refuses private IP | Scanner connects to private IP after rebinding |
+| **SSRF-001** Fargate/ECS metadata bait | Scanner refuses to fetch `169.254.170.2` | Scanner returns metadata content |
+| **SSRF-002** EC2 IMDS bait | Scanner refuses to fetch `169.254.169.254` | Scanner returns metadata content |
+| **SSRF-003** RFC1918 bait | Scanner refuses to fetch RFC1918 addresses | Scanner returns content from a private IP |
+| **SSRF-004** Localhost / IPv6 loopback / IPv6 ULA bait | Scanner refuses `127.0.0.1`, `[::1]`, `[fd00::1]` | Scanner returns content from any of them |
+| **SAFE-001** Scope escape | Scanner enforces scope; ignores off-scope redirect | Scanner follows redirect to `offscope.paleon-lab-hostile.com` |
+| **SAFE-002** Redirect loop | Scanner detects the loop within its max-hop budget | Scanner loops indefinitely or crashes |
+| **SAFE-003** Large body | Scanner enforces a body-size limit | Scanner OOMs or stores an unbounded body |
+| **SAFE-003** Slow body | Scanner enforces a read timeout | Scanner hangs indefinitely |
+| **SAFE-003** Gzip bomb | Scanner enforces a decompression limit | Scanner decompresses fully; OOM |
+| **SAFE-004** Malformed HTTP | Scanner rejects malformed HTTP gracefully | Scanner crashes, hangs, or accepts invalid framing |
+| **SAFE-004-TLS** Malformed TLS | Scanner reports a TLS failure and moves on | Scanner crashes or hangs on the bad handshake |
+| **SAFE-005** Passive safety | Scanner uses only safe methods | Scanner sends state-changing methods to the observer |
+| **SAFE-006** Termination safety | Scanner cancels the held connection cleanly | Scanner hangs or leaves orphan processes |
+| **SAFE-007** DNS rebinding | Scanner re-validates DNS and refuses the private IP | Scanner connects to the private IP after rebinding |
 
 ## Test ID Reference
 
 | Test ID | Category | Endpoint | Stimulus |
 |---------|----------|----------|----------|
-| SSRF-001 | SSRF | `/hostile/ssrf/fargate` | HTTP 302 redirect to 169.254.170.2/v2/credentials |
-| SSRF-002 | SSRF | `/hostile/ssrf/imds` | HTTP 302 redirect to 169.254.169.254/latest/meta-data/ |
-| SSRF-003 | SSRF | `/hostile/ssrf/rfc1918` | HTTP 302 redirect to 10.0.0.1/admin |
-| SSRF-004 | SSRF | `/hostile/ssrf/localhost` | HTTP 302 redirect to 127.0.0.1:8080/internal |
-| SSRF-004 | SSRF | `/hostile/ssrf/ipv6-loopback` | HTTP 302 redirect to [::1]:8080/internal |
-| SSRF-004 | SSRF | `/hostile/ssrf/ipv6-private` | HTTP 302 redirect to [fc00::1]/internal |
-| SAFE-001 | Scope Escape | `/hostile/scope-escape` | HTTP 302 redirect to https://offscope.paleon-lab-hostile.com/ |
-| SAFE-002 | Redirect Loop | `/hostile/redirect-loop` | 5-step redirect chain (steps 1-4: 302, step 5: 200) |
-| SAFE-003 | Resource Exhaustion | `/hostile/large-body` | 15MB streaming response (Content-Length: 15728640) |
-| SAFE-003 | Resource Exhaustion | `/hostile/slow-body` | 50 chunks over ~5 seconds (drip feed) |
-| SAFE-003 | Resource Exhaustion | `/hostile/gzip-bomb` | Gzip compressed ~1KB expanding to 100MB (Content-Encoding: gzip) |
-| SAFE-004 | Malformed Protocol | `/hostile/malformed/chunked` | Malformed chunked encoding (invalid hex size "GARBAGE") |
-| SAFE-004 | Malformed Protocol | `/hostile/malformed/banner` | Invalid HTTP status code 999 |
-| SAFE-005 | Passive Safety | `/hostile/read-only` | JSON response, rejects non-GET methods with 405 |
-| SAFE-006 | Termination Safety | `/hostile/kill-test` | Simple JSON endpoint for kill testing |
-| SAFE-007 | DNS Rebinding | `rebind-test.paleon-lab-hostile.com:8053` | UDP DNS: Query 1 returns 203.0.113.42, Query 2+ returns 10.0.0.50, TTL=0 |
+| SSRF-001 | SSRF | `/hostile/ssrf/fargate` | `302` → `http://169.254.170.2/v2/credentials/TEST_ONLY` |
+| SSRF-001 | SSRF | `/hostile/ssrf/fargate-relative` | `302` → `http://169.254.170.2/v2/credentials/test-site7` |
+| SSRF-002 | SSRF | `/hostile/ssrf/imds` | `302` → `http://169.254.169.254/latest/meta-data/` |
+| SSRF-003 | SSRF | `/hostile/ssrf/rfc1918?target=10\|172\|192` | `302` → `http://10.0.0.1/` (or `172.16.0.1/`, `192.168.0.1/`) |
+| SSRF-004 | SSRF | `/hostile/ssrf/localhost` | `302` → `http://127.0.0.1/` |
+| SSRF-004 | SSRF | `/hostile/ssrf/ipv6-loopback` | `302` → `http://[::1]/` |
+| SSRF-004 | SSRF | `/hostile/ssrf/ipv6-private` | `302` → `http://[fd00::1]/` |
+| SAFE-001 | Scope Escape | `/hostile/scope-escape` | `302` → `https://offscope.paleon-lab-hostile.com/landing` |
+| SAFE-002 | Redirect Loop | `/hostile/redirect-loop` | `302` chain `a → b → c → a`; `/hostile/self-loop` → itself |
+| SAFE-003 | Resource Exhaustion | `/hostile/large-body?size_mb=` | Streamed body, default 10 MB, max 20 MB (`Content-Length` set) |
+| SAFE-003 | Resource Exhaustion | `/hostile/slow-body?delay_ms=` | 10 × 1 KB chunks spread over the delay (default 5000 ms, max 15000 ms) |
+| SAFE-003 | Resource Exhaustion | `/hostile/gzip-bomb` | Valid gzip, ~10 KB compressed → 10 MB decompressed (`Content-Encoding: gzip`) |
+| SAFE-004 | Malformed HTTP | `https://malformed-http.paleon-lab-hostile.com/malformed/chunked` | `Transfer-Encoding: chunked` with an invalid chunk-size token `GARBAGE` |
+| SAFE-004 | Malformed HTTP | `https://malformed-http.paleon-lab-hostile.com/malformed/banner` | Control bytes in a header value + `Content-Length` shorter than the body |
+| SAFE-004-TLS | Malformed TLS | `https://malformed-tls.paleon-lab-hostile.com/` | Garbled TLS ServerHello; handshake never completes |
+| SAFE-005 | Passive Safety | `/hostile/read-only` | Any method → `200`; records the method/path/headers as an observation |
+| SAFE-006 | Termination Safety | `/hostile/kill-test` | Streams, holds the connection open for 15 s, then closes |
+| SAFE-007 | DNS Rebinding | `rebind-test.paleon-lab-hostile.com` (`:53`) | Query #1 → instance EIP; query #2+ → `192.168.1.1`; TTL=0 |
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** 2026-09-04  
+**Document Version:** 2.0  
+**Last Updated:** 2026-09-07  
 **Maintained By:** Paleon Test Infrastructure Team

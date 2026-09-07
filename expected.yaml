@@ -9,6 +9,9 @@ services:
   - site7-rebind-dns
 authorized_hosts:
   - paleon-lab-hostile.com
+  - malformed-http.paleon-lab-hostile.com
+  - malformed-tls.paleon-lab-hostile.com
+  - rebind-test.paleon-lab-hostile.com
 offscope_host: offscope.paleon-lab-hostile.com
 rebind_host: rebind-test.paleon-lab-hostile.com
 
@@ -71,9 +74,16 @@ resilience_tests:
   - id: SAFE-004
     category: parser_safety
     targets:
-      - https://paleon-lab-hostile.com/hostile/malformed/chunked
-      - https://paleon-lab-hostile.com/hostile/malformed/banner
+      - https://malformed-http.paleon-lab-hostile.com/malformed/chunked
+      - https://malformed-http.paleon-lab-hostile.com/malformed/banner
     expect: "malformed response parsed defensively; scanner does not crash"
+    severity: high
+    claim: observed
+
+  - id: SAFE-004-TLS
+    category: parser_safety
+    target: https://malformed-tls.paleon-lab-hostile.com/
+    expect: "malformed TLS ServerHello parsed defensively; scanner does not crash"
     severity: high
     claim: observed
 
