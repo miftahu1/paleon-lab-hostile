@@ -1,17 +1,45 @@
 site: paleon-lab-hostile.com
-sector: hostile-target
-description: Hostile adversarial target used to validate scanner safety and resilience
-reset: "./reset.sh"
+sector: hostile
+description: Hostile adversarial target used to validate scanner safety, scope enforcement, parser resilience, resource limits, passive behavior, and DNS-rebinding handling.
+reset: ./reset.sh
+
+detections: []
+
+must_not_flag:
+  - category: credential_acquired
+    reason: A scanner must not obtain or treat link-local/metadata content as a successful credential acquisition.
+
+  - category: internal_resource_access
+    reason: Redirects to localhost, RFC1918, link-local, or private IPv6 targets must be refused before access.
+
+  - category: off_scope_host_scanned
+    target: offscope.paleon-lab-hostile.com
+    reason: Off-scope redirects must not result in requests to the off-scope host.
+
+  - category: destructive_request
+    reason: Normal scanning must remain passive and must not perform state-changing actions.
+
+  - category: unbounded_redirect_following
+    reason: Redirect loops must terminate within configured limits.
+
+  - category: scanner_crash_as_success
+    reason: Parser crashes or process failures are not successful safety outcomes.
+
+  - category: successful_private_connect
+    reason: A private-address connection after DNS rebinding is a safety failure, not a valid finding.
+
 services:
   - nginx
   - paleon-site7
   - site7-malformed-server
   - site7-rebind-dns
+
 authorized_hosts:
   - paleon-lab-hostile.com
   - malformed-http.paleon-lab-hostile.com
   - malformed-tls.paleon-lab-hostile.com
   - rebind-test.paleon-lab-hostile.com
+
 offscope_host: offscope.paleon-lab-hostile.com
 rebind_host: rebind-test.paleon-lab-hostile.com
 
@@ -19,21 +47,21 @@ resilience_tests:
   - id: SSRF-001
     category: ssrf_safety
     target: https://paleon-lab-hostile.com/hostile/ssrf/fargate
-    expect: "redirect refused before reaching link-local credentials endpoint"
+    expect: redirect refused before reaching link-local credentials endpoint
     severity: critical
     claim: observed
 
   - id: SSRF-002
     category: ssrf_safety
     target: https://paleon-lab-hostile.com/hostile/ssrf/imds
-    expect: "redirect to EC2 metadata endpoint refused"
+    expect: redirect to EC2 metadata endpoint refused
     severity: critical
     claim: observed
 
   - id: SSRF-003
     category: ssrf_safety
     target: https://paleon-lab-hostile.com/hostile/ssrf/rfc1918
-    expect: "redirect to private RFC1918 address refused"
+    expect: redirect to private RFC1918 address refused
     severity: critical
     claim: observed
 
@@ -43,21 +71,21 @@ resilience_tests:
       - https://paleon-lab-hostile.com/hostile/ssrf/localhost
       - https://paleon-lab-hostile.com/hostile/ssrf/ipv6-loopback
       - https://paleon-lab-hostile.com/hostile/ssrf/ipv6-private
-    expect: "redirect to loopback/private IPv6 refused"
+    expect: redirect to loopback/private IPv6 refused
     severity: critical
     claim: observed
 
   - id: SAFE-001
     category: scope_safety
     target: https://paleon-lab-hostile.com/hostile/scope-escape
-    expect: "off-scope redirect not followed; offscope.paleon-lab-hostile.com receives no request"
+    expect: off-scope redirect not followed; offscope.paleon-lab-hostile.com receives no request
     severity: high
     claim: observed
 
   - id: SAFE-002
     category: redirect_safety
     target: https://paleon-lab-hostile.com/hostile/redirect-loop
-    expect: "redirect loop terminated within configured limit; no unbounded following"
+    expect: redirect loop terminated within configured limit; no unbounded following
     severity: high
     claim: observed
 
@@ -67,7 +95,7 @@ resilience_tests:
       - https://paleon-lab-hostile.com/hostile/large-body
       - https://paleon-lab-hostile.com/hostile/slow-body
       - https://paleon-lab-hostile.com/hostile/gzip-bomb
-    expect: "response size and duration bounded by scanner limits; no resource runaway"
+    expect: response size and duration bounded by scanner limits; no resource runaway
     severity: high
     claim: observed
 
@@ -76,46 +104,37 @@ resilience_tests:
     targets:
       - https://malformed-http.paleon-lab-hostile.com/malformed/chunked
       - https://malformed-http.paleon-lab-hostile.com/malformed/banner
-    expect: "malformed response parsed defensively; scanner does not crash"
+    expect: malformed response parsed defensively; scanner does not crash
     severity: high
     claim: observed
 
   - id: SAFE-004-TLS
     category: parser_safety
     target: https://malformed-tls.paleon-lab-hostile.com/
-    expect: "malformed TLS ServerHello parsed defensively; scanner does not crash"
+    expect: malformed TLS ServerHello parsed defensively; scanner does not crash
     severity: high
     claim: observed
 
   - id: SAFE-005
     category: passive_safety
     target: https://paleon-lab-hostile.com/hostile/read-only
-    expect: "no state-changing requests observed during normal scan"
+    expect: no state-changing requests observed during normal scan
     severity: high
     claim: observed
 
   - id: SAFE-006
     category: termination_safety
     target: https://paleon-lab-hostile.com/hostile/kill-test
-    expect: "scanner terminates cleanly when scan is killed; no orphan processes"
+    expect: scanner terminates cleanly when scan is killed; no orphan processes
     severity: medium
     claim: observed
 
   - id: SAFE-007
     category: dns_rebinding_safety
     target: rebind-test.paleon-lab-hostile.com
-    expect: "scanner re-validates DNS on reconnect; refuses private address after rebinding"
+    expect: scanner re-validates DNS on reconnect; refuses private address after rebinding
     severity: critical
     claim: observed
-
-must_not_flag:
-  - credential_acquired
-  - internal_resource_access
-  - off_scope_host_scanned
-  - destructive_request
-  - unbounded_redirect_following
-  - scanner_crash_as_success
-  - successful_private_connect
 
 evidence_requirements:
   - all_claims_must_be_observed
