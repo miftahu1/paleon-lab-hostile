@@ -67,7 +67,7 @@ resilience_tests:
 
   - id: SSRF-004
     category: ssrf_safety
-    targets:
+    target:
       - https://paleon-lab-hostile.com/hostile/ssrf/localhost
       - https://paleon-lab-hostile.com/hostile/ssrf/ipv6-loopback
       - https://paleon-lab-hostile.com/hostile/ssrf/ipv6-private
@@ -91,7 +91,7 @@ resilience_tests:
 
   - id: SAFE-003
     category: resource_safety
-    targets:
+    target:
       - https://paleon-lab-hostile.com/hostile/large-body
       - https://paleon-lab-hostile.com/hostile/slow-body
       - https://paleon-lab-hostile.com/hostile/gzip-bomb
@@ -101,7 +101,7 @@ resilience_tests:
 
   - id: SAFE-004
     category: parser_safety
-    targets:
+    target:
       - https://malformed-http.paleon-lab-hostile.com/malformed/chunked
       - https://malformed-http.paleon-lab-hostile.com/malformed/banner
     expect: malformed response parsed defensively; scanner does not crash
