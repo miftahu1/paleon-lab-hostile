@@ -14,7 +14,16 @@
 variable "aws_region" {
   description = "AWS region where Site 7 resources are deployed."
   type        = string
-  default     = "us-east-1"
+  default     = "eu-west-2"
+}
+
+variable "expected_aws_account_id" {
+  description = "Required expected AWS account ID for the Sites 1-6 lab account. Site 7 planning/deployment fails if the active account differs."
+  type        = string
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_aws_account_id))
+    error_message = "expected_aws_account_id is required and must be a 12-digit AWS account ID."
+  }
 }
 
 # ------------------------------------------------------------------------------
@@ -38,15 +47,19 @@ variable "ami_id" {
 # ------------------------------------------------------------------------------
 
 variable "hostname" {
-  description = "Primary hostname for the Site 7 test target."
+  description = "Primary apex hostname for the Site 7 test target."
   type        = string
   default     = "paleon-lab-hostile.com"
 }
 
-variable "offscope_hostname" {
-  description = "Off-scope hostname resolved by the same server as the primary."
+variable "offscope_domain" {
+  description = "Operator-supplied separate registered domain used only as SAFE-001 redirect target. Never verify it in Paleon or add it as business-context host."
   type        = string
-  default     = "offscope.paleon-lab-hostile.com"
+  default     = ""
+  validation {
+    condition     = var.offscope_domain != "" && var.offscope_domain != var.hostname && !endswith(var.offscope_domain, ".${var.hostname}")
+    error_message = "offscope_domain must be populated with a separate registered domain outside the paleon-lab-hostile.com zone."
+  }
 }
 
 variable "rebind_hostname" {

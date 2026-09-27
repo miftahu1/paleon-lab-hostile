@@ -3,8 +3,75 @@ sector: hostile
 description: Hostile adversarial target used to validate scanner safety, scope enforcement, parser resilience, resource limits, passive behavior, and DNS-rebinding handling.
 reset: ./reset.sh
 
-detections: []
+# All labels below are repository expectations, not observations from a live
+# scanner run. Product finding severity remains unverified until an approved scan.
 
+# Ordinary findings legitimately present in the actual deployment configuration
+ordinary_findings:
+  - id: ORD-001
+    expectation: expected_informational_finding
+    finding_expected: true
+    finding: authoritative_dns_port_exposed
+    title: Authoritative DNS Port Exposed (TCP/UDP 53)
+    target: paleon-lab-hostile.com:53
+    severity: info
+    description: Ports 53 TCP and UDP are exposed publicly to 0.0.0.0/0 to provide non-recursive authoritative DNS answers for the delegated rebind-test zone.
+
+  - id: ORD-002
+    expectation: expected_finding
+    finding_expected: true
+    finding: missing_spf_record
+    title: Missing SPF TXT Record
+    target: paleon-lab-hostile.com
+    severity: expected
+    description: The Route 53 zone contains no SPF (v=spf1) TXT record because the test lab does not send or receive email.
+
+  - id: ORD-003
+    expectation: expected_finding
+    finding_expected: true
+    finding: missing_dmarc_record
+    title: Missing DMARC Policy Record
+    target: _dmarc.paleon-lab-hostile.com
+    severity: expected
+    description: The Route 53 zone contains no _dmarc TXT record because there is no email infrastructure associated with the hostile test target.
+
+  - id: ORD-004
+    expectation: expected_finding
+    finding_expected: true
+    finding: missing_security_headers
+    title: Missing Security Headers on HTTP Responses
+    target: "*.paleon-lab-hostile.com"
+    severity: expected
+    description: Responses from the Flask/Nginx endpoints do not set Strict-Transport-Security (HSTS), Content-Security-Policy (CSP), X-Frame-Options, or X-Content-Type-Options.
+
+  - id: ORD-005
+    expectation: informational_note
+    finding_expected: false
+    finding: http_to_https_redirect
+    title: Insecure HTTP Port 80 Redirects to HTTPS
+    target: paleon-lab-hostile.com:80
+    severity: info
+    description: Port 80 is open and returns HTTP 301 redirect to https://$host$request_uri.
+
+  - id: ORD-006
+    expectation: informational_note
+    finding_expected: false
+    finding: tls_protocols_active
+    title: Modern TLS Protocol Support (TLS 1.2 and TLS 1.3)
+    target: "*.paleon-lab-hostile.com:443"
+    severity: info
+    description: Port 443 supports TLS 1.2 and TLS 1.3 with standard secure ciphers.
+
+  - id: ORD-007
+    expectation: conditional_informational_note
+    finding: no_mx_records
+    title: No MX / No Mail Infrastructure (where applicable)
+    target: paleon-lab-hostile.com
+    severity: info
+    finding_expected: conditional
+    description: The configuration creates no MX or mail service. Report only after checking the active DNS zone; an externally maintained MX record would make this finding inapplicable.
+
+# Defensive safety invariants: the scanner MUST NOT exhibit these failure modes
 must_not_flag:
   - category: credential_acquired
     reason: A scanner must not obtain or treat link-local/metadata content as a successful credential acquisition.
@@ -13,8 +80,7 @@ must_not_flag:
     reason: Redirects to localhost, RFC1918, link-local, or private IPv6 targets must be refused before access.
 
   - category: off_scope_host_scanned
-    target: offscope.paleon-lab-hostile.com
-    reason: Off-scope redirects must not result in requests to the off-scope host.
+    reason: Off-scope redirects must not result in requests to the unverified off-scope destination domain.
 
   - category: destructive_request
     reason: Normal scanning must remain passive and must not perform state-changing actions.
@@ -23,7 +89,7 @@ must_not_flag:
     reason: Redirect loops must terminate within configured limits.
 
   - category: scanner_crash_as_success
-    reason: Parser crashes or process failures are not successful safety outcomes.
+    reason: Parser crashes, unhandled exceptions, or process failures are safety failures.
 
   - category: successful_private_connect
     reason: A private-address connection after DNS rebinding is a safety failure, not a valid finding.
@@ -36,108 +102,261 @@ services:
 
 authorized_hosts:
   - paleon-lab-hostile.com
+  - imds.paleon-lab-hostile.com
+  - fargate.paleon-lab-hostile.com
+  - rfc1918.paleon-lab-hostile.com
+  - loopback.paleon-lab-hostile.com
+  - ipv6.paleon-lab-hostile.com
+  - redirect-loop.paleon-lab-hostile.com
+  - self-loop.paleon-lab-hostile.com
+  - large-body.paleon-lab-hostile.com
+  - slow-body.paleon-lab-hostile.com
+  - gzip-body.paleon-lab-hostile.com
+  - observer.paleon-lab-hostile.com
+  - kill-test.paleon-lab-hostile.com
+  - ftp-redirect.paleon-lab-hostile.com
+  - slow-drip.paleon-lab-hostile.com
+  - slow-tls.paleon-lab-hostile.com
   - malformed-http.paleon-lab-hostile.com
   - malformed-tls.paleon-lab-hostile.com
+  - offscope-redirect.paleon-lab-hostile.com
   - rebind-test.paleon-lab-hostile.com
 
-offscope_host: offscope.paleon-lab-hostile.com
+offscope_domain_variable: OFFSCOPE_DOMAIN
 rebind_host: rebind-test.paleon-lab-hostile.com
 
 resilience_tests:
   - id: SSRF-001
     category: ssrf_safety
-    target: https://paleon-lab-hostile.com/hostile/ssrf/fargate
-    expect: redirect refused before reaching link-local credentials endpoint
-    severity: critical
-    claim: observed
+    hostname: fargate.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to http://169.254.170.2/v2/credentials/TEST_ONLY
+    expected_behavior: Scanner inspects Location header but refuses connection to link-local container metadata target
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: No outbound connection from scanner to 169.254.170.2; zero credential acquisition reported
+    termination_expectation: Immediate termination after inspecting 302 Location header
+    claim: expected
 
   - id: SSRF-002
     category: ssrf_safety
-    target: https://paleon-lab-hostile.com/hostile/ssrf/imds
-    expect: redirect to EC2 metadata endpoint refused
-    severity: critical
-    claim: observed
+    hostname: imds.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to http://169.254.169.254/latest/meta-data/
+    expected_behavior: Scanner inspects Location header but refuses connection to EC2 IMDS target
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: No outbound connection to 169.254.169.254; zero metadata content parsed or logged
+    termination_expectation: Immediate termination after inspecting 302 Location header
+    claim: expected
 
   - id: SSRF-003
     category: ssrf_safety
-    target: https://paleon-lab-hostile.com/hostile/ssrf/rfc1918
-    expect: redirect to private RFC1918 address refused
-    severity: critical
-    claim: observed
+    hostname: rfc1918.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to RFC1918 private IPv4 target (http://10.0.0.1/)
+    expected_behavior: Scanner inspects Location header but refuses connection to private RFC1918 addresses
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: No TCP connect packets sent to 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16
+    termination_expectation: Immediate termination after inspecting 302 Location header
+    claim: expected
 
   - id: SSRF-004
     category: ssrf_safety
-    target:
-      - https://paleon-lab-hostile.com/hostile/ssrf/localhost
-      - https://paleon-lab-hostile.com/hostile/ssrf/ipv6-loopback
-      - https://paleon-lab-hostile.com/hostile/ssrf/ipv6-private
-    expect: redirect to loopback/private IPv6 refused
-    severity: critical
-    claim: observed
+    hostname: loopback.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to http://127.0.0.1/
+    expected_behavior: Scanner inspects Location header but refuses connection to localhost/loopback
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: No TCP connect to 127.0.0.1; scanner reports destination refused
+    termination_expectation: Immediate termination after inspecting 302 Location header
+    claim: expected
+
+  - id: SSRF-004-IPV6
+    category: ssrf_safety
+    hostname: ipv6.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to IPv6 ULA target http://[fd00::1]/
+    expected_behavior: Scanner inspects Location header but refuses connection to IPv6 ULA or link-local targets
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: No IPv6 connect to [fd00::1]; destination refused
+    termination_expectation: Immediate termination after inspecting 302 Location header
+    claim: expected
 
   - id: SAFE-001
     category: scope_safety
-    target: https://paleon-lab-hostile.com/hostile/scope-escape
-    expect: off-scope redirect not followed; offscope.paleon-lab-hostile.com receives no request
-    severity: high
-    claim: observed
+    hostname: offscope-redirect.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to https://${OFFSCOPE_DOMAIN}/
+    expected_behavior: Scanner inspects Location header, determines destination domain is off-scope / unverified, and halts following
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: Zero requests received by OFFSCOPE_DOMAIN; scanner scope logs show redirect destination flagged off-scope
+    termination_expectation: Immediate termination after domain scope check
+    claim: expected
 
   - id: SAFE-002
     category: redirect_safety
-    target: https://paleon-lab-hostile.com/hostile/redirect-loop
-    expect: redirect loop terminated within configured limit; no unbounded following
-    severity: high
-    claim: observed
+    hostname: redirect-loop.paleon-lab-hostile.com
+    stimulus: Every path participates in a 3-cycle redirect chain (/b -> /c -> /a -> /b)
+    expected_behavior: Scanner caps maximum redirect following depth and terminates cleanly
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner terminates follow sequence at or below configured redirect ceiling (e.g. 5-10 hops); no loop runaway
+    termination_expectation: Clean loop termination within configured hop bound
+    claim: expected
+
+  - id: SAFE-002-SELF
+    category: redirect_safety
+    hostname: self-loop.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to itself (request.url)
+    expected_behavior: Scanner detects immediate cycle / self-redirect and refuses re-request
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner terminates follow sequence after detecting identical URL
+    termination_expectation: Immediate cycle break on 1st hop
+    claim: expected
 
   - id: SAFE-003
     category: resource_safety
-    target:
-      - https://paleon-lab-hostile.com/hostile/large-body
-      - https://paleon-lab-hostile.com/hostile/slow-body
-      - https://paleon-lab-hostile.com/hostile/gzip-bomb
-    expect: response size and duration bounded by scanner limits; no resource runaway
-    severity: high
-    claim: observed
+    hostname: large-body.paleon-lab-hostile.com
+    stimulus: Every path streams generated bytes up to 20MB (default 10MB) with valid Content-Length
+    expected_behavior: Scanner truncates or aborts read when maximum byte limit is reached without unbounded memory growth
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner process resident memory does not grow proportionally to payload; stream closed at bound
+    termination_expectation: Closed when scanner max body limit reached
+    claim: expected
+
+  - id: SAFE-003-SLOW
+    category: resource_safety
+    hostname: slow-body.paleon-lab-hostile.com
+    stimulus: Every path streams 1KB chunks with configurable delays (default 5000ms)
+    expected_behavior: Scanner enforces read/connection timeout and closes connection
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner times out within configured read timeout window
+    termination_expectation: Connection dropped after timeout expiry
+    claim: expected
+
+  - id: SAFE-003-GZIP
+    category: resource_safety
+    hostname: gzip-body.paleon-lab-hostile.com
+    stimulus: Every path returns gzip response (~10KB compressed -> 10MB decompressed)
+    expected_behavior: Scanner enforces maximum decompressed byte limit during streaming decompression without OOM crash
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner limits decompressed buffer; memory usage stays bounded
+    termination_expectation: Decompression terminated cleanly at limit
+    claim: expected
 
   - id: SAFE-004
     category: parser_safety
-    target:
-      - https://malformed-http.paleon-lab-hostile.com/malformed/chunked
-      - https://malformed-http.paleon-lab-hostile.com/malformed/banner
-    expect: malformed response parsed defensively; scanner does not crash
-    severity: high
-    claim: observed
+    hostname: malformed-http.paleon-lab-hostile.com
+    stimulus: Completes TLS handshake on port 9999, then emits invalid chunked encoding or control characters in headers
+    expected_behavior: HTTP parser handles invalid framing and control bytes defensively without crash or panic
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: No process crash, stack trace, or unhandled exception in scanner logs; connection closed cleanly
+    termination_expectation: Connection dropped after parser framing error
+    claim: expected
 
   - id: SAFE-004-TLS
     category: parser_safety
-    target: https://malformed-tls.paleon-lab-hostile.com/
-    expect: malformed TLS ServerHello parsed defensively; scanner does not crash
-    severity: high
-    claim: observed
+    hostname: malformed-tls.paleon-lab-hostile.com
+    stimulus: Reads ClientHello on port 9998, then emits deliberately garbled ServerHello record
+    expected_behavior: TLS client library handles invalid handshake record defensively without crash
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: TLS handshake failure reported as standard SSL/TLS error; zero crash
+    termination_expectation: Handshake aborted immediately upon parsing garbled record
+    claim: expected
 
   - id: SAFE-005
     category: passive_safety
-    target: https://paleon-lab-hostile.com/hostile/read-only
-    expect: no state-changing requests observed during normal scan
-    severity: high
-    claim: observed
+    hostname: observer.paleon-lab-hostile.com
+    stimulus: Accepts ANY HTTP method and path, logs request headers/method to in-memory store, returns 200
+    expected_behavior: Scanner conducts passive, non-destructive inspection only
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: The target accepts any method; observation records what the scanner sent. Expected scanner behavior is that normal scanning sends only non-destructive methods (for example GET/HEAD/OPTIONS), with no state-changing requests.
+    termination_expectation: Normal request completion
+    claim: expected
 
   - id: SAFE-006
     category: termination_safety
-    target: https://paleon-lab-hostile.com/hostile/kill-test
-    expect: scanner terminates cleanly when scan is killed; no orphan processes
-    severity: medium
-    claim: observed
+    hostname: kill-test.paleon-lab-hostile.com
+    stimulus: Streams initial greeting then holds connection for 15 seconds before closing
+    expected_behavior: Scanner scan task terminates cleanly when stopped/killed by scanner controller
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Process terminates promptly on SIGTERM/SIGINT with zero orphan child processes or socket leaks
+    termination_expectation: Task terminated by controller within hold period
+    claim: expected
 
   - id: SAFE-007
     category: dns_rebinding_safety
-    target: rebind-test.paleon-lab-hostile.com
-    expect: scanner re-validates DNS on reconnect; refuses private address after rebinding
-    severity: critical
-    claim: observed
+    hostname: rebind-test.paleon-lab-hostile.com
+    stimulus: Authoritative DNS daemon on port 53 returns public EIP on 1st query, then 192.168.1.1 on subsequent queries (TTL=0)
+    expected_behavior: Scanner re-resolves and validates DNS before reconnecting; refuses connection to private 192.168.1.1
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: Scanner logs show DNS re-resolution; zero connection attempt to 192.168.1.1
+    termination_expectation: Connection aborted when re-resolved IP is private
+    claim: expected
+
+  - id: SAFE-008
+    category: protocol_safety
+    hostname: ftp-redirect.paleon-lab-hostile.com
+    stimulus: Every path returns HTTP 302 redirect to ftp://rebind-test.paleon-lab-hostile.com/resource
+    expected_behavior: Scanner refuses to follow non-HTTP(S) scheme redirect or cross-protocol transition
+    severity: expected
+    silent_expected: true
+    finding_expected: false
+    evidence_required: No outbound FTP connection initiated to target; redirect refused
+    termination_expectation: Immediate termination on unsupported URL scheme
+    claim: expected
+
+  - id: SAFE-009
+    category: resource_safety
+    hostname: slow-drip.paleon-lab-hostile.com
+    stimulus: Every path sends exactly 1 byte every 10 seconds for up to 10 minutes (60 chunks max)
+    expected_behavior: Scanner enforces maximum total request/transaction timeout regardless of incremental packet activity
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner drops connection when total timeout limit is exceeded (e.g. 30s-60s) rather than holding for 10 minutes
+    termination_expectation: Aborted by scanner total transaction timeout
+    claim: expected
+
+  - id: SAFE-010-TLS
+    category: parser_safety
+    hostname: slow-tls.paleon-lab-hostile.com
+    stimulus: Accepts TCP connection on port 9997, reads ClientHello, then delays response for 10 seconds
+    expected_behavior: Scanner enforces TLS handshake timeout and aborts cleanly
+    severity: expected
+    silent_expected: false
+    finding_expected: false
+    evidence_required: Scanner aborts handshake on handshake timeout expiry; no thread hung indefinitely
+    termination_expectation: Connection closed by scanner after handshake timeout
+    claim: expected
 
 evidence_requirements:
   - all_claims_must_be_observed
   - no_absolute_safety_claims
   - redirect_locations_inspected_not_followed
-  - off_scope_host_request_count_confirmed_zero
+  - off_scope_destination_request_count_confirmed_zero
+  - dns_rebinding_correlation_via_structured_logs

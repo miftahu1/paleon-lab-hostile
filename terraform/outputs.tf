@@ -23,6 +23,11 @@ output "instance_id" {
   value       = aws_instance.paleon-site7.id
 }
 
+output "current_aws_account_id" {
+  description = "AWS account ID selected by the active credentials. Verify this is the Sites 1-6 lab account."
+  value       = data.aws_caller_identity.current.account_id
+}
+
 # ------------------------------------------------------------------------------
 # Security
 # ------------------------------------------------------------------------------
@@ -43,13 +48,16 @@ output "route53_zone_id" {
 
 output "hostnames" {
   description = "List of all hostnames served by the Site 7 instance."
-  value = [
-    var.hostname,
-    var.offscope_hostname,
-    "malformed-http.${var.hostname}",
-    "malformed-tls.${var.hostname}",
-    var.rebind_hostname,
-  ]
+  value = concat(
+    [var.hostname],
+    [for sub in local.hostile_subdomains : "${sub}.${var.hostname}"],
+    ["ns1.${var.hostname}", var.rebind_hostname]
+  )
+}
+
+output "offscope_target_domain" {
+  description = "Separate unverified off-scope destination domain used for scope-escape tests."
+  value       = var.offscope_domain
 }
 
 # ------------------------------------------------------------------------------
@@ -69,12 +77,29 @@ output "deployment_summary" {
      Elastic IP    : ${aws_eip.paleon-site7-eip.public_ip}
      Security Group: ${aws_security_group.paleon-site7-sg.id}
     ------------------------------------------------------------
-     Hostnames :
-       Primary      : ${var.hostname}          -> ${aws_eip.paleon-site7-eip.public_ip}
-       Off-scope    : ${var.offscope_hostname}  -> ${aws_eip.paleon-site7-eip.public_ip}
-       Malformed HTTP : malformed-http.${var.hostname} -> ${aws_eip.paleon-site7-eip.public_ip}
-       Malformed TLS  : malformed-tls.${var.hostname} -> ${aws_eip.paleon-site7-eip.public_ip}
-       Rebind       : ${var.rebind_hostname}    -> NS ns1.${var.hostname}
+     Primary Domain: ${var.hostname} -> ${aws_eip.paleon-site7-eip.public_ip}
+     Dedicated Hostile Subdomains:
+       imds              : imds.${var.hostname}
+       fargate           : fargate.${var.hostname}
+       rfc1918           : rfc1918.${var.hostname}
+       loopback          : loopback.${var.hostname}
+       ipv6              : ipv6.${var.hostname}
+       redirect-loop     : redirect-loop.${var.hostname}
+       self-loop         : self-loop.${var.hostname}
+       large-body        : large-body.${var.hostname}
+       slow-body         : slow-body.${var.hostname}
+       gzip-body         : gzip-body.${var.hostname}
+       observer          : observer.${var.hostname}
+       kill-test         : kill-test.${var.hostname}
+       ftp-redirect      : ftp-redirect.${var.hostname}
+       slow-drip         : slow-drip.${var.hostname}
+       slow-tls          : slow-tls.${var.hostname}
+       malformed-http    : malformed-http.${var.hostname}
+       malformed-tls     : malformed-tls.${var.hostname}
+       offscope-redirect : offscope-redirect.${var.hostname} -> https://${var.offscope_domain}/
+     DNS Infrastructure:
+       ns1 (authoritative): ns1.${var.hostname} -> ${aws_eip.paleon-site7-eip.public_ip}
+       rebind-test (NS)  : ${var.rebind_hostname} -> NS ns1.${var.hostname}
     ============================================================
      SSH: ssh -i <key>.pem ubuntu@${aws_eip.paleon-site7-eip.public_ip}
     ============================================================

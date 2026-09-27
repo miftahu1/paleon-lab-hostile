@@ -11,7 +11,7 @@
 #     - Elastic IP allocated first, then associated (no dependency cycle)
 #     - User data receives the EIP via templatefile (no IMDS / no external IP lookup)
 #   Route 53 (parent zone paleon-lab-hostile.com)
-#     - A: apex, offscope, malformed-http, malformed-tls, ns1
+#     - A: apex, dedicated hostile subdomains, ns1 -> EIP
 #     - NS: rebind-test.paleon-lab-hostile.com -> ns1.paleon-lab-hostile.com
 # ==============================================================================
 
@@ -27,6 +27,35 @@ provider "aws" {
       Purpose     = "hostile-test-target"
     }
   }
+}
+
+data "aws_caller_identity" "current" {}
+
+# ------------------------------------------------------------------------------
+# Single Source of Truth for Dedicated Hostile Subdomains
+# ------------------------------------------------------------------------------
+
+locals {
+  hostile_subdomains = [
+    "imds",
+    "fargate",
+    "rfc1918",
+    "loopback",
+    "ipv6",
+    "redirect-loop",
+    "self-loop",
+    "large-body",
+    "slow-body",
+    "gzip-body",
+    "observer",
+    "kill-test",
+    "ftp-redirect",
+    "slow-drip",
+    "slow-tls",
+    "malformed-http",
+    "malformed-tls",
+    "offscope-redirect",
+  ]
 }
 
 # ------------------------------------------------------------------------------
@@ -65,6 +94,13 @@ resource "aws_security_group" "paleon-site7-sg" {
   name        = "${var.project_name}-sg"
   description = "Site 7 hostile test target - no shared resources with other sites"
   vpc_id      = data.aws_vpc.default.id
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
 
   ingress {
     description = "HTTP from anywhere"
@@ -116,15 +152,16 @@ resource "aws_security_group" "paleon-site7-sg" {
 # ------------------------------------------------------------------------------
 # Elastic IP (allocated independently of the instance — no cycle)
 # ------------------------------------------------------------------------------
-# Cycle-safe lifecycle:
-#   1. Allocate EIP (public_ip known immediately)
-#   2. Create instance (user_data injects that public_ip)
-#   3. Associate EIP to instance
-# Instance user_data must NOT reference the association, and the EIP resource
-# must NOT set instance = aws_instance.id.
 
 resource "aws_eip" "paleon-site7-eip" {
   domain = "vpc"
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
 
   tags = {
     Name = "${var.project_name}-eip"
@@ -144,10 +181,19 @@ resource "aws_instance" "paleon-site7" {
   # No IAM instance profile — intentionally minimal permissions.
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    domain_name = var.hostname
-    public_ip   = aws_eip.paleon-site7-eip.public_ip
+    domain_name        = var.hostname
+    public_ip          = aws_eip.paleon-site7-eip.public_ip
+    offscope_domain    = var.offscope_domain
+    hostile_subdomains = local.hostile_subdomains
   })
   user_data_replace_on_change = true
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id. Use the Sites 1-6 lab account, never the Paleon SaaS/application account."
+    }
+  }
 
   metadata_options {
     http_endpoint = "enabled"
@@ -168,6 +214,13 @@ resource "aws_instance" "paleon-site7" {
 resource "aws_eip_association" "paleon-site7-eip" {
   instance_id   = aws_instance.paleon-site7.id
   allocation_id = aws_eip.paleon-site7-eip.id
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
 }
 
 # ------------------------------------------------------------------------------
@@ -181,35 +234,30 @@ resource "aws_route53_record" "paleon-site7-primary" {
   ttl     = 300
   records = [aws_eip.paleon-site7-eip.public_ip]
 
-  depends_on = [aws_eip_association.paleon-site7-eip]
-}
-
-resource "aws_route53_record" "paleon-site7-offscope" {
-  zone_id = var.route53_zone_id
-  name    = var.offscope_hostname
-  type    = "A"
-  ttl     = 300
-  records = [aws_eip.paleon-site7-eip.public_ip]
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
 
   depends_on = [aws_eip_association.paleon-site7-eip]
 }
 
-resource "aws_route53_record" "paleon-site7-malformed-http" {
-  zone_id = var.route53_zone_id
-  name    = "malformed-http.${var.hostname}"
-  type    = "A"
-  ttl     = 300
-  records = [aws_eip.paleon-site7-eip.public_ip]
+resource "aws_route53_record" "paleon-site7-subdomains" {
+  for_each = toset(local.hostile_subdomains)
+  zone_id  = var.route53_zone_id
+  name     = "${each.key}.${var.hostname}"
+  type     = "A"
+  ttl      = 300
+  records  = [aws_eip.paleon-site7-eip.public_ip]
 
-  depends_on = [aws_eip_association.paleon-site7-eip]
-}
-
-resource "aws_route53_record" "paleon-site7-malformed-tls" {
-  zone_id = var.route53_zone_id
-  name    = "malformed-tls.${var.hostname}"
-  type    = "A"
-  ttl     = 300
-  records = [aws_eip.paleon-site7-eip.public_ip]
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
 
   depends_on = [aws_eip_association.paleon-site7-eip]
 }
@@ -222,6 +270,13 @@ resource "aws_route53_record" "paleon-site7-ns1" {
   ttl     = 300
   records = [aws_eip.paleon-site7-eip.public_ip]
 
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
+
   depends_on = [aws_eip_association.paleon-site7-eip]
 }
 
@@ -232,6 +287,13 @@ resource "aws_route53_record" "paleon-site7-rebind-ns" {
   type    = "NS"
   ttl     = 300
   records = ["ns1.${var.hostname}"]
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "Current AWS account does not match expected_aws_account_id; no Site 7 resources may be created in this account."
+    }
+  }
 
   depends_on = [aws_eip_association.paleon-site7-eip]
 }

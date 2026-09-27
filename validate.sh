@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PALEON SITE 7 — STATIC VALIDATION of the final architecture
+# PALEON SITE 7 — STATIC VALIDATION of the dedicated subdomain architecture
 # Does not require a deployed host, AWS credentials, or Docker.
 set -euo pipefail
 
@@ -53,20 +53,36 @@ data = yaml.safe_load(open("expected.yaml"))
 auth = set(data.get("authorized_hosts") or [])
 need = {
     "paleon-lab-hostile.com",
+    "imds.paleon-lab-hostile.com",
+    "fargate.paleon-lab-hostile.com",
+    "rfc1918.paleon-lab-hostile.com",
+    "loopback.paleon-lab-hostile.com",
+    "ipv6.paleon-lab-hostile.com",
+    "redirect-loop.paleon-lab-hostile.com",
+    "self-loop.paleon-lab-hostile.com",
+    "large-body.paleon-lab-hostile.com",
+    "slow-body.paleon-lab-hostile.com",
+    "gzip-body.paleon-lab-hostile.com",
+    "observer.paleon-lab-hostile.com",
+    "kill-test.paleon-lab-hostile.com",
+    "ftp-redirect.paleon-lab-hostile.com",
+    "slow-drip.paleon-lab-hostile.com",
+    "slow-tls.paleon-lab-hostile.com",
     "malformed-http.paleon-lab-hostile.com",
     "malformed-tls.paleon-lab-hostile.com",
+    "offscope-redirect.paleon-lab-hostile.com",
     "rebind-test.paleon-lab-hostile.com",
 }
-if data.get("offscope_host") != "offscope.paleon-lab-hostile.com":
+if data.get("offscope_domain_variable") != "OFFSCOPE_DOMAIN":
     sys.exit(1)
 if auth != need:
     sys.exit(1)
-if "offscope.paleon-lab-hostile.com" in auth:
+if "offscope" + ".paleon-lab-hostile.com" in auth:
     sys.exit(1)
 sys.exit(0)
 PY
 then
-    check_pass "expected.yaml authorized_hosts and offscope_host"
+    check_pass "expected.yaml authorized_hosts and offscope configuration"
 else
     check_fail "expected.yaml authorized_hosts/offscope mismatch"
 fi
@@ -101,13 +117,17 @@ scan_fail_if_found '\b5001\b' "stale port 5001"
 scan_fail_if_found '\b5002\b' "stale port 5002"
 scan_fail_if_found '\b5353\b' "stale port 5353"
 scan_fail_if_found '\b8053\b' "stale port 8053"
-scan_fail_if_found 'site7\.paleon-lab-hostile\.com' "stale hostname site7.paleon-lab-hostile.com"
+scan_fail_if_found 'site7\.paleon''-lab-hostile\.com' "stale Site 7 hostname"
 scan_fail_if_found 'paleon-site7\.git' "stale repo URL paleon-site7.git"
 scan_fail_if_found 'Amazon Linux' "Amazon Linux reference"
 scan_fail_if_found '\bec2-user\b' "ec2-user reference"
 scan_fail_if_found 'docker[ -]compose' "Docker Compose reference"
 scan_fail_if_found 'C:/Users|/home/mifta' "developer absolute path"
 scan_fail_if_found '93\.184\.216\.34' "third-party public-IP fallback 93.184.216.34"
+scan_fail_if_found 'offscope\.paleon''-lab-hostile\.com' "stale in-scope off-scope hostname"
+scan_fail_if_found '/host''ile/' "stale path-based hostile endpoint architecture"
+scan_fail_if_found 'offscope_''hostname' "stale off-scope variable"
+scan_fail_if_found 'us-east''-1' "stale AWS region"
 
 # IMDS / metadata in application/DNS (redirect stimuli in Flask are allowed)
 if grep -n '169.254.169.254' app/rebind_dns_server.py app/malformed_server.py >/dev/null 2>&1; then
@@ -134,7 +154,7 @@ else
     check_fail "Flask bind is not 127.0.0.1:5000"
 fi
 
-if grep -n '0.0.0.0' app/app.py app/malformed_server.py >/dev/null; then
+if grep -nF '0.0.0.0' app/app.py app/malformed_server.py >/dev/null; then
     check_fail "0.0.0.0 bind in Flask or malformed server"
 else
     check_pass "Flask/malformed servers do not bind 0.0.0.0"
@@ -170,13 +190,44 @@ else
     check_fail "malformed HTTP may be proxied as HTTP"
 fi
 
-if grep -n 'malformed-http.${var.hostname}' terraform/main.tf >/dev/null \
-   && grep -n 'malformed-tls.${var.hostname}' terraform/main.tf >/dev/null \
+if grep -n 'proxy_buffering off;' terraform/user_data.sh.tftpl >/dev/null \
+   && grep -n 'proxy_read_timeout 660s;' terraform/user_data.sh.tftpl >/dev/null \
+   && grep -n 'proxy_timeout 660s;' terraform/user_data.sh.tftpl >/dev/null; then
+    check_pass "Nginx preserves streams with finite 660s timeouts"
+else
+    check_fail "Nginx streaming or finite timeout configuration missing"
+fi
+
+if grep -nF 'location = /internal/site7-observation { return 404; }' terraform/user_data.sh.tftpl >/dev/null \
+   && grep -nF 'internal/site7-observation' test_all_endpoints.py >/dev/null; then
+    check_pass "public observation endpoint blocked and regression-tested"
+else
+    check_fail "public observation endpoint isolation regression missing"
+fi
+
+if grep -n 'paleon-site7-subdomains' terraform/main.tf >/dev/null \
    && grep -n 'paleon-site7-rebind-ns' terraform/main.tf >/dev/null \
    && grep -n 'paleon-site7-ns1' terraform/main.tf >/dev/null; then
-    check_pass "Route53 records for malformed hosts, ns1 glue, NS delegation"
+    check_pass "Route53 records for hostile subdomains, ns1 glue, NS delegation"
 else
-    check_fail "missing Route53 malformed/ns1/delegation records"
+    check_fail "missing Route53 hostile subdomains/ns1/delegation records"
+fi
+
+if grep -n 'data "aws_caller_identity" "current"' terraform/main.tf >/dev/null \
+   && grep -n 'expected_aws_account_id' terraform/variables.tf terraform/main.tf >/dev/null \
+   && grep -n 'current_aws_account_id' terraform/outputs.tf >/dev/null; then
+    check_pass "AWS caller identity output and expected account precondition"
+else
+    check_fail "AWS account guard/output missing"
+fi
+
+ACCOUNT_PRECONDITIONS=$(grep -c 'condition.*data.aws_caller_identity.current.account_id == var.expected_aws_account_id' terraform/main.tf || true)
+if grep -A6 'variable "expected_aws_account_id"' terraform/variables.tf | grep -q '^[[:space:]]*type[[:space:]]*=[[:space:]]*string' \
+   && ! grep -A6 'variable "expected_aws_account_id"' terraform/variables.tf | grep -q '^[[:space:]]*default[[:space:]]*=' \
+   && [ "$ACCOUNT_PRECONDITIONS" -ge 8 ]; then
+    check_pass "expected AWS account ID is mandatory and guarded on all resources"
+else
+    check_fail "expected AWS account ID can be omitted or a resource lacks its guard"
 fi
 
 if grep -n 'aws_eip_association' terraform/main.tf >/dev/null \
@@ -233,16 +284,28 @@ else
     check_fail "DNS capability bind missing"
 fi
 
-# Egress isolation must survive reboot (section 21): an ENABLED systemd oneshot
-# ordered before networking reinstalls the owner-uid REJECT rules every boot,
-# so isolation is not merely a runtime artifact that a reboot would drop.
+# Egress isolation must survive reboot: an ENABLED systemd oneshot ordered before
+# networking installs reply-only conntrack + explicit REJECT rules for the site7 user.
 if grep -q 'systemctl enable site7-egress-firewall.service' terraform/user_data.sh.tftpl \
    && grep -q 'Before=network-pre.target' terraform/user_data.sh.tftpl \
-   && grep -qE '\-\-uid-owner site7 -d 169\.254\.0\.0/16 -j REJECT' terraform/user_data.sh.tftpl \
+   && grep -q 'WantedBy=network-pre.target' terraform/user_data.sh.tftpl \
+   && ! grep -q 'Wants=network-pre.target' terraform/user_data.sh.tftpl \
+   && grep -qE -- '\-\-uid-owner site7 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT' terraform/user_data.sh.tftpl \
+   && grep -qE -- '\-\-uid-owner site7 -d 169\.254\.0\.0/16 -j REJECT' terraform/user_data.sh.tftpl \
+   && grep -qE -- '\-\-uid-owner site7 -d 127\.0\.0\.0/8(\s+)?-j REJECT' terraform/user_data.sh.tftpl \
+   && grep -qE -- '\-\-uid-owner site7 -m conntrack --ctstate NEW -j REJECT' terraform/user_data.sh.tftpl \
    && grep -qE 'ip6tables .*--uid-owner site7 .*-j REJECT' terraform/user_data.sh.tftpl; then
-    check_pass "egress isolation reboot-persistent (enabled oneshot; owner-uid REJECT incl. metadata + IPv6)"
+    check_pass "egress isolation reboot-persistent (reply-only conntrack; explicit metadata, loopback & IPv6 REJECT)"
 else
-    check_fail "egress isolation not reboot-persistent or missing owner-uid REJECT rules"
+    check_fail "egress isolation missing required reply-only conntrack or destination rules"
+fi
+
+if grep -q 'Requires=site7-egress-firewall.service' terraform/user_data.sh.tftpl \
+   && grep -q 'After=site7-egress-firewall.service' terraform/user_data.sh.tftpl \
+   && grep -q 'systemctl start site7-egress-firewall.service' terraform/user_data.sh.tftpl; then
+    check_pass "firewall starts before and is required by every Site 7 unit"
+else
+    check_fail "firewall startup dependency missing"
 fi
 
 if grep -n 'ThreadPoolExecutor' app/rebind_dns_server.py >/dev/null \
@@ -292,7 +355,7 @@ fi
 while IFS= read -r line; do
     file="${line%%:*}"
     rest="${line#*:}"
-    if echo "$rest" | grep -qE 'systemctl stop|iptables -C|ip6tables -C'; then
+    if echo "$rest" | grep -qE 'systemctl stop|iptables -C|ip6tables -C|iptables -N|ip6tables -N'; then
         continue
     fi
     check_fail "hidden || true in $file :: $rest"
@@ -305,42 +368,50 @@ else
     check_fail "bootstrap health gate missing"
 fi
 
-# Flask endpoints
+# Dedicated Subdomains in Flask
 if [ -f app/app.py ]; then
-    for ep in \
-        "/hostile/ssrf/fargate" \
-        "/hostile/ssrf/fargate-relative" \
-        "/hostile/ssrf/imds" \
-        "/hostile/ssrf/rfc1918" \
-        "/hostile/ssrf/localhost" \
-        "/hostile/ssrf/ipv6-loopback" \
-        "/hostile/ssrf/ipv6-private" \
-        "/hostile/scope-escape" \
-        "/hostile/redirect-loop" \
-        "/hostile/redirect-loop/a" \
-        "/hostile/large-body" \
-        "/hostile/slow-body" \
-        "/hostile/gzip-bomb" \
-        "/hostile/rebind" \
-        "/hostile/read-only" \
-        "/hostile/kill-test" \
-        "/internal/site7-observation" \
-        "/health"; do
-        if grep -q "$ep" app/app.py; then
-            check_pass "endpoint $ep"
+    for sub in \
+        "imds" \
+        "fargate" \
+        "rfc1918" \
+        "loopback" \
+        "ipv6" \
+        "redirect-loop" \
+        "self-loop" \
+        "large-body" \
+        "slow-body" \
+        "gzip-body" \
+        "observer" \
+        "kill-test" \
+        "ftp-redirect" \
+        "slow-drip" \
+        "offscope-redirect"; do
+        if grep -q "\"$sub\":" app/app.py; then
+            check_pass "subdomain handler $sub"
         else
-            check_fail "endpoint $ep missing"
+            check_fail "subdomain handler $sub missing"
         fi
     done
+    if grep -q "def health" app/app.py && grep -q "def internal_observation" app/app.py; then
+        check_pass "health and internal_observation endpoints"
+    else
+        check_fail "health or internal_observation endpoint missing"
+    fi
 fi
 
-for ep in "/malformed/chunked" "/malformed/banner"; do
+for ep in "/chunked" "/banner"; do
     if grep -q "$ep" app/malformed_server.py; then
         check_pass "malformed endpoint $ep"
     else
         check_fail "malformed endpoint $ep missing"
     fi
 done
+
+if grep -q 'PORT_SLOW_TLS = 9997' app/malformed_server.py; then
+    check_pass "slow TLS on port 9997"
+else
+    check_fail "slow TLS missing on port 9997"
+fi
 
 if [ -f expected.yaml ]; then
     RESILIENCE_IDS=$(python3 -c "

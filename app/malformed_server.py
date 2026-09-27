@@ -4,11 +4,13 @@ PALEON SITE 7 — HOSTILE TEST TARGET — DO NOT USE FOR PRODUCTION
 
 Localhost-only raw protocol backends used by Nginx stream ssl_preread on :443.
 
+Port 9997: Slow TLS Handshake — accept TCP, read bounded ClientHello, delay
+           the handshake response (10s), then close. (SAFE-010-TLS)
 Port 9998: Malformed TLS — accept TCP, read a bounded ClientHello, emit
-           deliberately malformed TLS bytes, close. Never HTTP.
+           deliberately malformed TLS bytes, close. Never HTTP. (SAFE-004-TLS)
 Port 9999: Malformed HTTP — complete a real TLS handshake, read bounded HTTP
            request bytes, emit malformed HTTP on the TLS socket, close.
-           SAFE-004 / SAFE-004-TLS.
+           (SAFE-004)
 
 Concurrency is bounded with a semaphore + thread pool (no unbounded
 thread-per-connection). Idle connections are reaped.
@@ -25,11 +27,13 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 HOST = "127.0.0.1"
+PORT_SLOW_TLS = 9997
 PORT_TLS = 9998
 PORT_HTTP = 9999
 MAX_CONNECTIONS_PER_PORT = 10
 IDLE_TIMEOUT = 30
 READ_TIMEOUT = 5.0
+SLOW_TLS_DELAY = 10.0
 MAX_READ_BYTES = 8192
 
 CERT_FILE = "/etc/ssl/site7/site7.crt"
@@ -123,6 +127,7 @@ class ConnectionManager:
             pass
 
 
+slow_tls_connections = ConnectionManager()
 tls_connections = ConnectionManager()
 http_connections = ConnectionManager()
 
@@ -163,6 +168,28 @@ GARBLED_SERVER_HELLO = (
 )
 
 
+def handle_slow_tls(conn: socket.socket, addr: tuple, conn_id: int):
+    """SAFE-010-TLS: Deliberately delay the TLS handshake response, then terminate cleanly."""
+    try:
+        read_until(conn, b"", max_bytes=MAX_READ_BYTES, timeout=READ_TIMEOUT)
+        slow_tls_connections.update_activity(conn_id)
+        time.sleep(SLOW_TLS_DELAY)
+        slow_tls_connections.update_activity(conn_id)
+        logger.info("slow_tls_handshake_delayed", extra={"connection_id": conn_id, "resilience_id": "SAFE-010-TLS"})
+    except Exception as e:
+        logger.warning("slow_tls_error", extra={"error": str(e), "connection_id": conn_id})
+    finally:
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+        slow_tls_connections.unregister(conn_id)
+
+
 def handle_raw_tls(conn: socket.socket, addr: tuple, conn_id: int):
     try:
         read_until(conn, b"", max_bytes=MAX_READ_BYTES, timeout=READ_TIMEOUT)
@@ -196,7 +223,7 @@ def handle_tls_http(conn: socket.socket, addr: tuple, conn_id: int):
         http_connections.update_activity(conn_id)
         request_str = data.decode("latin1", errors="ignore")
 
-        if "/malformed/chunked" in request_str:
+        if "/chunked" in request_str:
             payload = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
@@ -206,7 +233,7 @@ def handle_tls_http(conn: socket.socket, addr: tuple, conn_id: int):
                 b"0\r\n\r\n"
             )
             endpoint = "chunked"
-        elif "/malformed/banner" in request_str:
+        elif "/banner" in request_str:
             payload = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"X-Control-Header: \x00\x01\x02\x03\r\n"
@@ -251,7 +278,7 @@ def handle_tls_http(conn: socket.socket, addr: tuple, conn_id: int):
 def idle_reaper():
     while True:
         time.sleep(5)
-        for mgr in (tls_connections, http_connections):
+        for mgr in (slow_tls_connections, tls_connections, http_connections):
             for conn_id in mgr.check_idle():
                 mgr.close_id(conn_id)
                 logger.info("idle_connection_closed", extra={"connection_id": conn_id})
@@ -302,9 +329,16 @@ def main():
     reaper_thread = threading.Thread(target=idle_reaper, daemon=True, name="idle-reaper")
     reaper_thread.start()
 
+    slow_tls_pool = ThreadPoolExecutor(max_workers=MAX_CONNECTIONS_PER_PORT, thread_name_prefix="slow-tls-")
     tls_pool = ThreadPoolExecutor(max_workers=MAX_CONNECTIONS_PER_PORT, thread_name_prefix="malformed-tls-")
     http_pool = ThreadPoolExecutor(max_workers=MAX_CONNECTIONS_PER_PORT, thread_name_prefix="malformed-http-")
 
+    slow_tls_thread = threading.Thread(
+        target=run_server,
+        args=(PORT_SLOW_TLS, handle_slow_tls, slow_tls_connections, slow_tls_pool),
+        daemon=True,
+        name="listen-9997",
+    )
     tls_thread = threading.Thread(
         target=run_server,
         args=(PORT_TLS, handle_raw_tls, tls_connections, tls_pool),
@@ -317,14 +351,16 @@ def main():
         daemon=True,
         name="listen-9999",
     )
+    slow_tls_thread.start()
     tls_thread.start()
     http_thread.start()
 
-    logger.info("both_servers_started")
+    logger.info("all_servers_started", extra={"ports": [PORT_SLOW_TLS, PORT_TLS, PORT_HTTP]})
     try:
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
+        slow_tls_pool.shutdown(wait=False, cancel_futures=True)
         tls_pool.shutdown(wait=False, cancel_futures=True)
         http_pool.shutdown(wait=False, cancel_futures=True)
 

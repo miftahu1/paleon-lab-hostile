@@ -13,6 +13,12 @@ Only A queries for the intended hostname advance state.
 
 SITE7_EIP must be injected at deploy time. Missing/invalid configuration
 is a hard failure (no IMDS, no third-party IP discovery, no example.com).
+
+Note on Paleon Resolver Behavior:
+Paleon resolves through AWS recursive resolvers, meaning this authoritative server
+may observe AWS resolver source IPs rather than Paleon scanner IPs. Query evidence
+is logged with timestamp, source IP, query name, query type, answer returned,
+and state counters for external correlation.
 """
 
 import ipaddress
@@ -23,6 +29,7 @@ import struct
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,6 +43,23 @@ MAX_CLIENTS = 100
 MAX_WORKERS = 10
 MAX_DNS_MESSAGE = 4096
 UDP_RECV = 512
+
+
+def log_dns_query(source_ip: str, query_name: str, query_type: str,
+                  answer_returned: str, client_counter: int, total_a_queries: int):
+    """Structured JSON logging of DNS queries for scanner correlation."""
+    log_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": "dns_query",
+        "source_ip": source_ip,
+        "query_name": query_name,
+        "query_type": query_type,
+        "answer_returned": answer_returned,
+        "client_counter": client_counter,
+        "total_a_queries": total_a_queries,
+        "resilience_id": "SAFE-007",
+    }
+    print(json.dumps(log_entry), flush=True)
 
 
 def get_public_ip():
@@ -117,7 +141,7 @@ class DNSRebindServer:
             self.save_state()
             print("[REBIND] State reset to initial conditions")
 
-    def get_answer_ip(self, client_ip: str) -> str:
+    def get_answer_ip(self, client_ip: str) -> tuple:
         with self.lock:
             if client_ip not in self.client_counts and len(self.client_counts) >= MAX_CLIENTS:
                 self.client_counts.popitem(last=False)
@@ -127,12 +151,12 @@ class DNSRebindServer:
             # MAX_QUERIES_PER_CLIENT, never wrapped, so query #101+ stays private.
             # A client can never be handed the public IP again after its first query.
             answer = PUBLIC_IP if count == 0 else PRIVATE_IP
-            self.client_counts[client_ip] = min(count + 1, MAX_QUERIES_PER_CLIENT)
+            new_count = min(count + 1, MAX_QUERIES_PER_CLIENT)
+            self.client_counts[client_ip] = new_count
             self.client_counts.move_to_end(client_ip)
             self.total_a_queries += 1
             self.save_state()
-            print(f"[REBIND] {client_ip} A query #{count + 1} -> {answer} (SAFE-007)")
-            return answer
+            return answer, new_count
 
     def parse_dns_query(self, data: bytes):
         try:
@@ -202,13 +226,21 @@ class DNSRebindServer:
         if not parsed:
             return None
         txn_id, qname, qtype, qclass = parsed
+        qtype_str = {1: "A", 16: "TXT", 28: "AAAA"}.get(qtype, f"TYPE{qtype}")
+
         if qclass != 1:
+            log_dns_query(client_ip, qname, qtype_str, "REFUSED_CLASS", 0, self.total_a_queries)
             return self.build_refused(txn_id)
         if not self.is_test_name(qname):
+            log_dns_query(client_ip, qname, qtype_str, "REFUSED_ZONE", 0, self.total_a_queries)
             return self.build_refused(txn_id)
         if qtype != 1:
+            log_dns_query(client_ip, qname, qtype_str, "NODATA", 0, self.total_a_queries)
             return self.build_no_data(txn_id, qname, qtype)
-        answer_ip = self.get_answer_ip(client_ip)
+
+        answer_ip, client_count = self.get_answer_ip(client_ip)
+        log_dns_query(client_ip, qname, "A", answer_ip, client_count, self.total_a_queries)
+        print(f"[REBIND] {client_ip} A query #{client_count} -> {answer_ip} (SAFE-007)")
         return self.build_dns_response(txn_id, qname, answer_ip)
 
     def handle_udp_query(self, data, addr, sock):

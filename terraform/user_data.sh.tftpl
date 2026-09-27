@@ -6,6 +6,7 @@ set -euo pipefail
 
 DOMAIN_NAME="${domain_name}"
 PUBLIC_IP="${public_ip}"
+OFFSCOPE_DOMAIN="${offscope_domain}"
 APP_DIR="/opt/paleon-site7"
 DATA_DIR="/var/lib/site7"
 LOG_FILE="/var/log/paleon-site7-bootstrap.log"
@@ -15,6 +16,7 @@ TLS_GROUP="site7-tls"
 echo "=== PALEON SITE 7 BOOTSTRAP START ==="
 echo "Domain: $DOMAIN_NAME"
 echo "EIP: $PUBLIC_IP"
+echo "Offscope Target: $OFFSCOPE_DOMAIN"
 echo "Starting at $(date)"
 
 if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
@@ -80,8 +82,7 @@ usermod -aG "$TLS_GROUP" www-data
 echo "[3/12] Creating application directory..."
 mkdir -p "$APP_DIR"
 # DATA_DIR holds only the DNS rebinding state file (rebind-state.json).
-# Endpoint observations are kept in-memory (app.py ObservationStore, a bounded
-# deque) and exposed via /internal/site7-observation; there is no on-disk log.
+# Endpoint observations are kept in-memory (app.py ObservationStore, a bounded deque).
 mkdir -p "$DATA_DIR"
 chown -R site7:site7 "$DATA_DIR"
 chmod 750 "$DATA_DIR"
@@ -112,16 +113,60 @@ python3 -m pip install -r "$APP_DIR/deployed_requirements.txt" --quiet --break-s
 
 # 6. Create systemd units
 echo "[6/12] Creating systemd service files..."
-cat > /etc/systemd/system/paleon-site7.service << 'SERVICEEOF'
+# Install and activate egress isolation before defining or starting any Site 7
+# service. The same idempotent rules are refreshed later in this bootstrap.
+cat > /usr/local/sbin/site7-egress-firewall.sh << 'FWEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+iptables -N SITE7_OUTPUT 2>/dev/null || iptables -F SITE7_OUTPUT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+for range in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8; do
+  iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -d "$range" -j REJECT
+done
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate NEW -j REJECT
+iptables -C OUTPUT -j SITE7_OUTPUT 2>/dev/null || iptables -I OUTPUT 1 -j SITE7_OUTPUT
+ip6tables -N SITE7_OUTPUT 2>/dev/null || ip6tables -F SITE7_OUTPUT
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+for range in fc00::/7 fe80::/10 ::1/128; do
+  ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -d "$range" -j REJECT
+done
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate NEW -j REJECT
+ip6tables -C OUTPUT -j SITE7_OUTPUT 2>/dev/null || ip6tables -I OUTPUT 1 -j SITE7_OUTPUT
+FWEOF
+chmod 755 /usr/local/sbin/site7-egress-firewall.sh
+cat > /etc/systemd/system/site7-egress-firewall.service << 'FWUNITEOF'
+[Unit]
+Description=Site 7 egress isolation firewall (reply-only site7 traffic)
+DefaultDependencies=no
+Before=network-pre.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/site7-egress-firewall.sh
+
+[Install]
+WantedBy=network-pre.target
+FWUNITEOF
+systemctl daemon-reload
+systemctl enable site7-egress-firewall.service
+systemctl start site7-egress-firewall.service
+
+cat > /etc/systemd/system/paleon-site7.service << SERVICEEOF
 [Unit]
 Description=Paleon Site 7 - Hostile Test Target
-After=network.target
+Requires=site7-egress-firewall.service
+After=site7-egress-firewall.service network.target
 
 [Service]
 Type=simple
 User=site7
 Group=site7
 WorkingDirectory=/opt/paleon-site7
+Environment=OFFSCOPE_DOMAIN=${offscope_domain}
+Environment=PRIMARY_DOMAIN=${domain_name}
 ExecStart=/usr/bin/python3 /opt/paleon-site7/deployed_app.py
 Restart=always
 RestartSec=5
@@ -135,8 +180,9 @@ SERVICEEOF
 
 cat > /etc/systemd/system/site7-malformed-server.service << 'SERVICEEOF'
 [Unit]
-Description=Site 7 Malformed Response Server
-After=network.target
+Description=Site 7 Malformed and Slow Protocol Server
+Requires=site7-egress-firewall.service
+After=site7-egress-firewall.service network.target
 
 [Service]
 Type=simple
@@ -158,7 +204,8 @@ SERVICEEOF
 cat > /etc/systemd/system/site7-rebind-dns.service << SERVICEEOF
 [Unit]
 Description=Site 7 DNS Rebinding Simulator
-After=network.target
+Requires=site7-egress-firewall.service
+After=site7-egress-firewall.service network.target
 
 [Service]
 Type=simple
@@ -185,21 +232,33 @@ systemctl enable site7-malformed-server.service
 systemctl enable site7-rebind-dns.service
 
 # 7. Certificate Provisioning
-# Certify only names that need a valid TLS handshake.
-# Do NOT request a certificate for rebind-test (would consume DNS-rebinding state).
-# Do NOT request a certificate for malformed-tls (that vhost never completes TLS).
+# Certify apex and all dedicated hostile subdomains for Certificate Transparency discovery.
+# Explicitly EXCLUDE rebind-test (alternating DNS would fail validation / drain state).
+# Explicitly EXCLUDE ns1 (DNS infrastructure only).
 echo "[7/12] TLS CERTIFICATE PROVISIONING SEQUENCE"
 mkdir -p /etc/ssl/site7
 CERT_SUCCESS=false
 
-# Stop Nginx to release port 80 for standalone HTTP-01 (idempotent if not running)
+HOSTILE_SUBS=(
+%{ for sub in hostile_subdomains ~}
+    "${sub}"
+%{ endfor ~}
+)
+
+CERTBOT_DOMAINS=("-d" "$DOMAIN_NAME")
+SAN_LIST="DNS:$DOMAIN_NAME"
+for sub in "$${HOSTILE_SUBS[@]}"; do
+    CERTBOT_DOMAINS+=("-d" "$sub.$DOMAIN_NAME")
+    SAN_LIST="$SAN_LIST,DNS:$sub.$DOMAIN_NAME"
+done
+
+# Stop Nginx to release port 80 for standalone HTTP-01
 systemctl stop nginx 2>/dev/null || true
 
 set +e
-timeout 90s certbot certonly --standalone --non-interactive --agree-tos \
+timeout 120s certbot certonly --standalone --non-interactive --agree-tos \
     --email "admin@$DOMAIN_NAME" \
-    -d "$DOMAIN_NAME" \
-    -d "malformed-http.$DOMAIN_NAME" \
+    "$${CERTBOT_DOMAINS[@]}" \
     --http-01-port 80
 CERTBOT_RC=$?
 set -e
@@ -208,14 +267,14 @@ if [ "$CERTBOT_RC" -eq 0 ] && [ -s "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain
     cp "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" /etc/ssl/site7/site7.crt
     cp "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" /etc/ssl/site7/site7.key
     CERT_SUCCESS=true
-    echo "[INFO] Certbot certificate successfully issued"
+    echo "[INFO] Certbot certificate successfully issued with all hostile subdomains"
 else
     echo "[WARN] Certbot issuance unavailable (exit $CERTBOT_RC). Generating self-signed SAN certificate fallback..."
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout /etc/ssl/site7/site7.key \
         -out /etc/ssl/site7/site7.crt \
         -subj "/CN=$DOMAIN_NAME/O=Paleon Site 7/C=US" \
-        -addext "subjectAltName=DNS:$DOMAIN_NAME,DNS:malformed-http.$DOMAIN_NAME,DNS:offscope.$DOMAIN_NAME,DNS:ns1.$DOMAIN_NAME"
+        -addext "subjectAltName=$SAN_LIST"
 fi
 
 if [ ! -s /etc/ssl/site7/site7.crt ] || [ ! -s /etc/ssl/site7/site7.key ]; then
@@ -263,7 +322,7 @@ http {
     error_log /var/log/nginx/error.log;
     gzip off;
 
-    # Internal HTTPS termination for normal traffic (SNI default backend)
+    # Internal HTTPS termination for normal hostile subdomains (SNI default backend)
     server {
         listen 127.0.0.1:8443 ssl;
         server_name _;
@@ -271,13 +330,19 @@ http {
         ssl_certificate /etc/ssl/site7/site7.crt;
         ssl_certificate_key /etc/ssl/site7/site7.key;
 
+        # This operator endpoint is intentionally available only through the
+        # direct localhost:5000 listener, never through public HTTPS.
+        location = /internal/site7-observation { return 404; }
+
         location / {
             proxy_pass http://127.0.0.1:5000;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 20s;
+            proxy_read_timeout 660s;
+            proxy_buffering off;
+            proxy_request_buffering off;
             proxy_connect_timeout 5s;
         }
     }
@@ -294,12 +359,15 @@ http {
 }
 
 # Stream layer for SNI routing on port 443.
-# malformed-http is NOT HTTP-proxied: Nginx forwards raw TCP after ssl_preread.
-# malformed-tls is NOT converted to HTTP: raw TCP to the malformed TLS backend.
+# malformed-tls forwards raw TCP to 9998 (garbled ServerHello)
+# malformed-http forwards raw TCP to 9999 (TLS + bad HTTP framing)
+# slow-tls forwards raw TCP to 9997 (delayed handshake)
+# default terminates TLS at 8443 and HTTP-proxies to Flask (5000)
 stream {
     map $ssl_preread_server_name $backend_name {
         ~^malformed-tls\.    127.0.0.1:9998;
         ~^malformed-http\.   127.0.0.1:9999;
+        ~^slow-tls\.         127.0.0.1:9997;
         default              127.0.0.1:8443;
     }
 
@@ -307,7 +375,8 @@ stream {
         listen 443;
         ssl_preread on;
         proxy_pass $backend_name;
-        proxy_timeout 20s;
+        # Idle timeout stays finite; 10-second drip packets keep the stream alive.
+        proxy_timeout 660s;
         proxy_connect_timeout 5s;
     }
 }
@@ -330,6 +399,13 @@ systemctl start paleon-site7.service
 
 # 10. Start Nginx
 echo "[10/12] Starting Nginx..."
+mkdir -p /etc/systemd/system/nginx.service.d
+cat > /etc/systemd/system/nginx.service.d/site7-firewall.conf << 'NGINXUNITEOF'
+[Unit]
+Requires=site7-egress-firewall.service
+After=site7-egress-firewall.service
+NGINXUNITEOF
+systemctl daemon-reload
 systemctl start nginx
 systemctl enable nginx
 
@@ -337,41 +413,48 @@ systemctl enable nginx
 sleep 3
 
 # Host firewall: block application-user egress to private/link-local destinations.
-# Persistent across reboot via a systemd oneshot ordered before networking, so the
-# unprivileged 'site7' user can never reach RFC1918 / link-local / ULA ranges even
-# after a reboot. DNS replies to public clients remain allowed (the reply's
-# destination is the querier, not a private range). This is defense-in-depth: the
-# application code performs no outbound connections in the first place.
+# Persistent across reboot via a systemd oneshot ordered before networking.
+# Deterministic rule ordering via dedicated chain SITE7_OUTPUT:
+# 1. Allow ESTABLISHED/RELATED reply traffic from site7 services
+# 2. Deny specific prohibited destinations (metadata, RFC1918, loopback, ULA)
+# 3. Deny ANY new outbound connection initiated by site7
 echo "[10.1/12] Installing persistent site7 egress restrictions..."
 cat > /usr/local/sbin/site7-egress-firewall.sh << 'FWEOF'
 #!/usr/bin/env bash
 # PALEON SITE 7 — egress isolation for the unprivileged 'site7' user.
-# Idempotent: -C checks existence before -I inserts, so it is safe to run on
-# every boot and re-run during bootstrap without duplicating rules.
+# Deterministic ordering via dedicated chain SITE7_OUTPUT:
+# 1. Allow ESTABLISHED/RELATED reply traffic from site7 services
+# 2. Deny specific prohibited ranges (metadata, RFC1918, loopback, ULA)
+# 3. Deny ANY new outbound connection initiated by site7
 set -euo pipefail
 
-apply() {
-    # apply <iptables|ip6tables> <rule-spec...> : insert an OUTPUT REJECT rule
-    # only if an identical rule is not already present.
-    local bin="$1"; shift
-    "$bin" -C OUTPUT "$@" 2>/dev/null || "$bin" -I OUTPUT "$@"
-}
+# IPv4 rules
+iptables -N SITE7_OUTPUT 2>/dev/null || iptables -F SITE7_OUTPUT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -d 169.254.0.0/16 -j REJECT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -d 10.0.0.0/8 -j REJECT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -d 172.16.0.0/12 -j REJECT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -d 192.168.0.0/16 -j REJECT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -d 127.0.0.0/8 -j REJECT
+iptables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate NEW -j REJECT
+iptables -C OUTPUT -j SITE7_OUTPUT 2>/dev/null || iptables -I OUTPUT 1 -j SITE7_OUTPUT
 
-apply iptables  -m owner --uid-owner site7 -d 169.254.0.0/16 -j REJECT
-apply iptables  -m owner --uid-owner site7 -d 10.0.0.0/8     -j REJECT
-apply iptables  -m owner --uid-owner site7 -d 172.16.0.0/12  -j REJECT
-apply iptables  -m owner --uid-owner site7 -d 192.168.0.0/16 -j REJECT
-apply ip6tables -m owner --uid-owner site7 -d fc00::/7       -j REJECT
-apply ip6tables -m owner --uid-owner site7 -d fe80::/10      -j REJECT
+# IPv6 rules
+ip6tables -N SITE7_OUTPUT 2>/dev/null || ip6tables -F SITE7_OUTPUT
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -d fc00::/7       -j REJECT
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -d fe80::/10      -j REJECT
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -d ::1/128        -j REJECT
+ip6tables -A SITE7_OUTPUT -m owner --uid-owner site7 -m conntrack --ctstate NEW -j REJECT
+ip6tables -C OUTPUT -j SITE7_OUTPUT 2>/dev/null || ip6tables -I OUTPUT 1 -j SITE7_OUTPUT
 FWEOF
 chmod 755 /usr/local/sbin/site7-egress-firewall.sh
 
 cat > /etc/systemd/system/site7-egress-firewall.service << 'FWUNITEOF'
 [Unit]
-Description=Site 7 egress isolation firewall (site7 user -> private/link-local REJECT)
+Description=Site 7 egress isolation firewall (site7 user reply-only isolation)
 Documentation=https://github.com/miftahu1/paleon-lab-hostile
 DefaultDependencies=no
-Wants=network-pre.target
 Before=network-pre.target
 Conflicts=shutdown.target
 Before=shutdown.target
@@ -382,7 +465,7 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/site7-egress-firewall.sh
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=network-pre.target
 FWUNITEOF
 
 systemctl daemon-reload
@@ -417,6 +500,10 @@ if ! ss -tlnp | grep -q '127.0.0.1:8443'; then
     echo "[FATAL] TCP 8443 (internal HTTPS) is NOT listening"
     HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
 fi
+if ! ss -tlnp | grep -q '127.0.0.1:9997'; then
+    echo "[FATAL] TCP 9997 (slow TLS) is NOT listening"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+fi
 if ! ss -tlnp | grep -q '127.0.0.1:9998'; then
     echo "[FATAL] TCP 9998 (malformed TLS) is NOT listening"
     HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
@@ -447,8 +534,8 @@ if ! curl -sf --max-time 5 http://127.0.0.1:5000/health >/dev/null; then
     HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
 fi
 
-if ! nc -z -w 3 127.0.0.1 9998 || ! nc -z -w 3 127.0.0.1 9999; then
-    echo "[FATAL] Hostile raw backends (9998/9999) unreachable"
+if ! nc -z -w 3 127.0.0.1 9997 || ! nc -z -w 3 127.0.0.1 9998 || ! nc -z -w 3 127.0.0.1 9999; then
+    echo "[FATAL] Hostile raw backends (9997/9998/9999) unreachable"
     HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
 fi
 

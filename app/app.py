@@ -3,14 +3,14 @@
 PALEON SITE 7 — HOSTILE TEST TARGET — DO NOT USE FOR PRODUCTION
 
 Flask application for hostile scanner resilience testing.
-Provides endpoints to test SSRF, DNS rebinding, redirect loops, resource exhaustion,
-malformed responses, and scope escape attempts.
+Implements dedicated subdomains for every hostile stimulus so that external
+scanners (which do not crawl links) exercise every test target via root/fixed paths.
 
 Security constraints:
     - No outbound network calls
     - No database, no authentication, no sessions
     - Resource limits enforced (MAX_BODY_SIZE=20MB, MAX_DELAY=15000ms,
-      kill-test hold=15s, gzip decompressed output=10MB)
+      kill-test hold=15s, gzip decompressed output=10MB, slow-drip 10min)
     - Structured JSON logging without credentials/secrets
     - Streaming responses to avoid allocating entire hostile payloads in RAM
 """
@@ -25,6 +25,7 @@ import zlib
 from functools import wraps
 from datetime import datetime, timezone
 from typing import Generator, Optional
+from collections import deque
 
 from flask import Flask, request, Response, redirect, jsonify, stream_with_context
 
@@ -35,7 +36,13 @@ MAX_BODY_SIZE = 20 * 1024 * 1024  # 20 MB absolute maximum
 MAX_DELAY = 15000  # 15 seconds
 MAX_KILL_HOLD = 15  # seconds
 MAX_GZIP_DECOMPRESSED = 10 * 1024 * 1024  # 10 MB
+SLOW_DRIP_INTERVAL = 10  # 1 byte every 10 seconds
+SLOW_DRIP_CHUNKS = 60  # 60 chunks * 10s = 600s (10 minutes)
 MAIN_PORT = 5000
+
+OFFSCOPE_DOMAIN = os.environ.get("OFFSCOPE_DOMAIN", "").strip()
+PRIMARY_DOMAIN = os.environ.get("PRIMARY_DOMAIN", "paleon-lab-hostile.com").strip()
+
 SENSITIVE_HEADER_KEYS = (
     'cookie', 'authorization', 'password', 'secret', 'token',
     'api_key', 'apikey', 'api-key', 'x-api-key', 'credential', 'credentials',
@@ -55,21 +62,18 @@ class JSONFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
 
-        # Add extra fields from record
         for key, value in record.__dict__.items():
             if key not in ('name', 'msg', 'args', 'created', 'filename', 'funcName',
                            'levelname', 'levelno', 'lineno', 'module', 'msecs',
-                           'message', 'msg', 'name', 'pathname', 'process',
-                           'processName', 'relativeCreated', 'thread', 'threadName',
+                           'message', 'pathname', 'process', 'processName',
+                           'relativeCreated', 'thread', 'threadName',
                            'exc_info', 'exc_text', 'stack_info'):
-                # Filter out sensitive fields
                 if key.lower() not in SENSITIVE_HEADER_KEYS:
                     log_entry[key] = value
 
         return json.dumps(log_entry)
 
 
-# Configure logger
 logger = logging.getLogger("paleon.site7")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
@@ -79,8 +83,6 @@ logger.addHandler(handler)
 # ============================================================================
 # Observations Storage (in-memory, thread-safe)
 # ============================================================================
-from collections import deque
-
 class ObservationStore:
     """Thread-safe in-memory storage for endpoint observations."""
 
@@ -104,7 +106,7 @@ class ObservationStore:
 observation_store = ObservationStore()
 
 # ============================================================================
-# Logging Helper
+# Logging Helpers
 # ============================================================================
 def log_test_hit(test_id: str, method: str, path: str, status: int,
                  redirect_dest: Optional[str] = None, body_size: int = 0,
@@ -117,6 +119,7 @@ def log_test_hit(test_id: str, method: str, path: str, status: int,
             "test_id": test_id,
             "method": method,
             "path": path,
+            "host": request.host,
             "status": status,
             "redirect_destination": redirect_dest,
             "body_size_bytes": body_size,
@@ -134,6 +137,7 @@ def log_observation(test_id: str, method: str, path: str, headers: dict, **extra
         "test_id": test_id,
         "method": method,
         "path": path,
+        "host": request.host,
         "headers": {k: v for k, v in headers.items()
                     if k.lower() not in SENSITIVE_HEADER_KEYS},
         **extra
@@ -169,11 +173,19 @@ def generate_large_body(size_bytes: int, chunk_size: int = 65536) -> Generator[b
 def generate_slow_body(delay_ms: int, chunks: int = 10) -> Generator[bytes, None, None]:
     """Generate small chunks with delay between each."""
     chunk_data = b"x" * 1024  # 1KB per chunk
-    delay_per_chunk = delay_ms / chunks / 1000.0  # Convert to seconds
+    delay_per_chunk = delay_ms / chunks / 1000.0
 
     for _ in range(chunks):
         yield chunk_data
         time.sleep(delay_per_chunk)
+
+
+def generate_slow_drip(interval_sec: int = SLOW_DRIP_INTERVAL,
+                       total_chunks: int = SLOW_DRIP_CHUNKS) -> Generator[bytes, None, None]:
+    """Stream exactly one byte every interval_sec seconds for up to total_chunks."""
+    for _ in range(total_chunks):
+        yield b"X"
+        time.sleep(interval_sec)
 
 
 def generate_gzip_bomb_stream(
@@ -182,9 +194,7 @@ def generate_gzip_bomb_stream(
 ) -> Generator[bytes, None, None]:
     """Stream a valid gzip payload that decompresses to decompressed_size.
 
-    Uses zlib.compressobj(wbits=31) so output is a real gzip member. Input is
-    generated in small zero-chunks; the full 10MB decompressed buffer is never
-    held in RAM. Compressed output is yielded as the compressor produces it.
+    Uses zlib.compressobj(wbits=31) so output is a real gzip member.
     """
     size = min(decompressed_size, MAX_GZIP_DECOMPRESSED)
     compressor = zlib.compressobj(level=9, wbits=31)
@@ -207,331 +217,87 @@ def generate_gzip_bomb_stream(
 # ============================================================================
 app = Flask(__name__)
 
-# ============================================================================
-# Landing Page
-# ============================================================================
-@app.route('/')
-def landing():
-    """Landing page with test category listing."""
-    html = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Paleon Site 7 — Hostile Scanner Resilience Lab</title>
-    <style>
-        * { box-sizing: border-box; }
-        body {
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            line-height: 1.6;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 2rem 1rem;
-            color: #1a1a1a;
-            background: #fafafa;
-        }
-        header { margin-bottom: 2rem; }
-        h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 0.5rem; }
-        .subtitle { color: #666; font-size: 1.1rem; }
-        nav { margin: 1.5rem 0; }
-        nav ul { list-style: none; padding: 0; display: grid; gap: 0.75rem; }
-        nav li { background: white; border: 1px solid #e0e0e0; border-radius: 6px; padding: 1rem; transition: border-color 0.2s; }
-        nav li:hover { border-color: #999; }
-        nav a { text-decoration: none; color: #1a1a1a; font-weight: 500; display: block; }
-        nav a:focus { outline: 2px solid #0066cc; outline-offset: 2px; border-radius: 4px; }
-        .category { font-size: 0.9rem; color: #666; margin-top: 0.25rem; }
-        .endpoints { display: grid; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.85rem; font-family: monospace; color: #444; }
-        .endpoint { background: #f5f5f5; padding: 0.4rem 0.6rem; border-radius: 4px; }
-        .warning { background: #fff3cd; border: 1px solid #ffc107; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; }
-        .warning strong { color: #856404; }
-        footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #e0e0e0; color: #888; font-size: 0.85rem; }
-        @media (max-width: 600px) {
-            body { padding: 1rem; }
-            h1 { font-size: 1.5rem; }
-        }
-    </style>
-</head>
-<body>
-    <header>
-        <h1>Paleon Site 7 — Hostile Scanner Resilience Lab</h1>
-        <p class="subtitle">Test endpoints for scanner resilience evaluation. <strong>Not for production use.</strong></p>
-    </header>
-
-    <div class="warning">
-        <strong>Warning:</strong> These endpoints are designed to stress-test scanners and may cause hangs, crashes, or unexpected behavior. Use only in controlled test environments.
-    </div>
-
-    <nav aria-label="Test categories">
-        <ul>
-            <li>
-                <a href="/hostile/ssrf">SSRF Tests</a>
-                <span class="category">Server-Side Request Forgery test vectors</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/ssrf/fargate — Redirect to Fargate metadata endpoint</div>
-                    <div class="endpoint">GET /hostile/ssrf/fargate-relative — Redirect to Fargate metadata (relative path)</div>
-                    <div class="endpoint">GET /hostile/ssrf/imds — Redirect to EC2 IMDS</div>
-                    <div class="endpoint">GET /hostile/ssrf/rfc1918?target=10|172|192 — Redirect to RFC1918 address</div>
-                    <div class="endpoint">GET /hostile/ssrf/localhost — Redirect to 127.0.0.1</div>
-                    <div class="endpoint">GET /hostile/ssrf/ipv6-loopback — Redirect to [::1]</div>
-                    <div class="endpoint">GET /hostile/ssrf/ipv6-private — Redirect to [fd00::1]</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/rebind">DNS Rebinding Test</a>
-                <span class="category">Returns link to rebind-test.paleon-lab-hostile.com</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/rebind — HTML page with rebind test link</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/scope-escape">Scope Escape</a>
-                <span class="category">Redirects to off-scope domain</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/scope-escape — 302 to offscope.paleon-lab-hostile.com</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/redirect-loop">Redirect Loops</a>
-                <span class="category">Infinite redirect chains</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/redirect-loop/a → b → c → a</div>
-                    <div class="endpoint">GET /hostile/self-loop — 302 to itself</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/large-body">Large Body</a>
-                <span class="category">Streaming response up to 20MB</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/large-body?size_mb=10 (default 10, max 20)</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/slow-body">Slow Body</a>
-                <span class="category">Delayed streaming response</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/slow-body?delay_ms=5000 (default 5000, max 15000)</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/gzip-bomb">Gzip Bomb</a>
-                <span class="category">~10KB compressed → ~10MB decompressed</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/gzip-bomb</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/malformed">Malformed Responses (via SNI routing)</a>
-                <span class="category">Invalid HTTP/TLS responses on dedicated subdomains</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET https://malformed-http.paleon-lab-hostile.com/malformed/chunked — Invalid chunked encoding</div>
-                    <div class="endpoint">GET https://malformed-http.paleon-lab-hostile.com/malformed/banner — Junk HTTP banner</div>
-                    <div class="endpoint">GET https://malformed-tls.paleon-lab-hostile.com/ — Garbled TLS ServerHello</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/read-only">Read-Only Observer</a>
-                <span class="category">Logs request details, returns 200</span>
-                <div class="endpoints">
-                    <div class="endpoint">ANY /hostile/read-only</div>
-                </div>
-            </li>
-            <li>
-                <a href="/hostile/kill-test">Connection Hold</a>
-                <span class="category">Holds connection for 15s then closes</span>
-                <div class="endpoints">
-                    <div class="endpoint">GET /hostile/kill-test</div>
-                </div>
-            </li>
-        </ul>
-    </nav>
-
-    <footer>
-        <p>PALEON SITE 7 — HOSTILE TEST TARGET — DO NOT USE FOR PRODUCTION</p>
-        <p>Internal observation endpoint: <code>/internal/site7-observation</code> (localhost only)</p>
-    </footer>
-</body>
-</html>"""
-    return Response(html, mimetype='text/html')
-
 
 # ============================================================================
-# SSRF Test Endpoints
+# Host Handlers
 # ============================================================================
-@app.route('/hostile/ssrf/fargate')
-def ssrf_fargate():
-    """302 redirect to Fargate metadata endpoint. SSRF-001"""
-    dest = "http://169.254.170.2/v2/credentials/TEST_ONLY"
-    log_test_hit("ssrf_fargate", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
 
-
-@app.route('/hostile/ssrf/fargate-relative')
-def ssrf_fargate_relative():
-    """302 redirect to Fargate metadata endpoint (relative-path variant). SSRF-001"""
-    dest = "http://169.254.170.2/v2/credentials/test-site7"
-    log_test_hit("ssrf_fargate_relative", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
-
-
-@app.route('/hostile/ssrf/imds')
-def ssrf_imds():
+def handle_imds():
     """302 redirect to EC2 IMDS endpoint. SSRF-002"""
     dest = "http://169.254.169.254/latest/meta-data/"
-    log_test_hit("ssrf_imds", request.method, request.path, 302, redirect_dest=dest)
+    log_test_hit("ssrf_imds", request.method, request.path, 302, redirect_dest=dest, resilience_id="SSRF-002")
     return redirect(dest, code=302)
 
 
-@app.route('/hostile/ssrf/rfc1918')
-def ssrf_rfc1918():
+def handle_fargate():
+    """302 redirect to Fargate metadata endpoint. SSRF-001"""
+    dest = "http://169.254.170.2/v2/credentials/TEST_ONLY"
+    log_test_hit("ssrf_fargate", request.method, request.path, 302, redirect_dest=dest, resilience_id="SSRF-001")
+    return redirect(dest, code=302)
+
+
+def handle_rfc1918():
     """302 redirect to RFC1918 address based on target parameter. SSRF-003"""
     target = request.args.get('target', '10')
-
     targets = {
         '10': 'http://10.0.0.1/',
         '172': 'http://172.16.0.1/',
         '192': 'http://192.168.0.1/',
     }
-
     dest = targets.get(target, targets['10'])
     log_test_hit("ssrf_rfc1918", request.method, request.path, 302,
-                 redirect_dest=dest, target=target)
+                 redirect_dest=dest, target=target, resilience_id="SSRF-003")
     return redirect(dest, code=302)
 
 
-@app.route('/hostile/ssrf/localhost')
-def ssrf_localhost():
-    """302 redirect to localhost. SSRF-004"""
+def handle_loopback():
+    """302 redirect to loopback IPv4. SSRF-004"""
     dest = "http://127.0.0.1/"
-    log_test_hit("ssrf_localhost", request.method, request.path, 302, redirect_dest=dest)
+    log_test_hit("ssrf_localhost", request.method, request.path, 302, redirect_dest=dest, resilience_id="SSRF-004")
     return redirect(dest, code=302)
 
 
-@app.route('/hostile/ssrf/ipv6-loopback')
-def ssrf_ipv6_loopback():
-    """302 redirect to IPv6 loopback. SSRF-004"""
-    dest = "http://[::1]/"
-    log_test_hit("ssrf_ipv6_loopback", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
-
-
-@app.route('/hostile/ssrf/ipv6-private')
-def ssrf_ipv6_private():
-    """302 redirect to IPv6 private (ULA) address. SSRF-004"""
+def handle_ipv6():
+    """302 redirect to IPv6 private (ULA) address. SSRF-004 / SSRF-004-IPV6"""
     dest = "http://[fd00::1]/"
-    log_test_hit("ssrf_ipv6_private", request.method, request.path, 302, redirect_dest=dest)
+    log_test_hit("ssrf_ipv6_private", request.method, request.path, 302, redirect_dest=dest, resilience_id="SSRF-004-IPV6")
     return redirect(dest, code=302)
 
 
-# ============================================================================
-# DNS Rebinding Test
-# ============================================================================
-@app.route('/hostile/rebind')
-def rebind():
-    """Returns HTML with link to rebind test hostname. SAFE-007"""
-    hostname = "rebind-test.paleon-lab-hostile.com"
-    log_test_hit("dns_rebind", request.method, request.path, 200,
-                 redirect_dest=None, off_scope=False)
-    log_observation("dns_rebind", request.method, request.path, dict(request.headers))
+def handle_redirect_loop():
+    """3-cycle redirect loop. SAFE-002"""
+    # Deterministic cycle: any request to /b -> /c; /c -> /a; all other paths (/, /a, etc.) -> /b
+    path = request.path.rstrip('/')
+    if path == '/b':
+        dest = "/c"
+    elif path == '/c':
+        dest = "/a"
+    else:
+        dest = "/b"
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DNS Rebinding Test</title>
-    <style>
-        body {{ font-family: system-ui, sans-serif; max-width: 600px; margin: 2rem auto; padding: 1rem; }}
-        a {{ color: #0066cc; word-break: break-all; }}
-    </style>
-</head>
-<body>
-    <h1>DNS Rebinding Test</h1>
-    <p>Test hostname: <a href="http://{hostname}">{hostname}</a></p>
-    <p>The DNS server for this domain returns a public IP on first query, then a private IP (192.168.1.1) on subsequent queries (TTL=0).</p>
-    <p><a href="/">← Back to landing</a></p>
-</body>
-</html>"""
-    return Response(html, mimetype='text/html')
-
-
-# ============================================================================
-# Scope Escape
-# ============================================================================
-@app.route('/hostile/scope-escape')
-def scope_escape():
-    """302 redirect to off-scope domain. SAFE-001"""
-    dest = "https://offscope.paleon-lab-hostile.com/landing"
-    log_test_hit("scope_escape", request.method, request.path, 302,
-                 redirect_dest=dest, off_scope=True)
+    log_test_hit("redirect_loop", request.method, request.path, 302, redirect_dest=dest, resilience_id="SAFE-002")
     return redirect(dest, code=302)
 
 
-@app.route('/health')
-def health():
-    """Local process health for bootstrap/ops. Not a scanner resilience test."""
-    return jsonify({"status": "ok", "service": "paleon-site7"}), 200
-
-
-# ============================================================================
-# Redirect Loops
-# ============================================================================
-@app.route('/hostile/redirect-loop')
-def redirect_loop_entry():
-    """Start of the 3-cycle redirect loop. SAFE-002"""
-    dest = "/hostile/redirect-loop/a"
-    log_test_hit("redirect_loop", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
-
-
-@app.route('/hostile/redirect-loop/a')
-def redirect_loop_a():
-    """Redirect to /hostile/redirect-loop/b. SAFE-002"""
-    dest = "/hostile/redirect-loop/b"
-    log_test_hit("redirect_loop_a", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
-
-
-@app.route('/hostile/redirect-loop/b')
-def redirect_loop_b():
-    """Redirect to /hostile/redirect-loop/c. SAFE-002"""
-    dest = "/hostile/redirect-loop/c"
-    log_test_hit("redirect_loop_b", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
-
-
-@app.route('/hostile/redirect-loop/c')
-def redirect_loop_c():
-    """Redirect to /hostile/redirect-loop/a (completes the loop). SAFE-002"""
-    dest = "/hostile/redirect-loop/a"
-    log_test_hit("redirect_loop_c", request.method, request.path, 302, redirect_dest=dest)
-    return redirect(dest, code=302)
-
-
-@app.route('/hostile/self-loop')
-def self_loop():
-    """302 redirect to itself. SAFE-002"""
+def handle_self_loop():
+    """302 redirect to itself. SAFE-002 / SAFE-002-SELF"""
     dest = request.url
-    log_test_hit("self_loop", request.method, request.path, 302, redirect_dest=dest)
+    log_test_hit("self_loop", request.method, request.path, 302, redirect_dest=dest, resilience_id="SAFE-002-SELF")
     return redirect(dest, code=302)
 
 
-# ============================================================================
-# Large Body (Streaming)
-# ============================================================================
-@app.route('/hostile/large-body')
-def large_body():
+def handle_large_body():
     """Stream generated bytes up to 20MB without allocating in RAM. SAFE-003"""
     try:
         size_mb = int(request.args.get('size_mb', '10'))
     except ValueError:
         size_mb = 10
 
-    # Clamp to valid range: default 10MB, max 20MB (MAX_BODY_SIZE)
     size_mb = max(1, min(size_mb, MAX_BODY_SIZE // (1024 * 1024)))
     size_bytes = size_mb * 1024 * 1024
 
     log_test_hit("large_body", request.method, request.path, 200,
-                 body_size=size_bytes, delay_profile=f"{size_mb}MB")
+                 body_size=size_bytes, delay_profile=f"{size_mb}MB", resilience_id="SAFE-003")
 
     def generate():
         for chunk in generate_large_body(size_bytes):
@@ -544,22 +310,17 @@ def large_body():
     )
 
 
-# ============================================================================
-# Slow Body (Streaming with delay)
-# ============================================================================
-@app.route('/hostile/slow-body')
-def slow_body():
-    """Stream small data with configurable delay. SAFE-003"""
+def handle_slow_body():
+    """Stream small data with configurable delay. SAFE-003 / SAFE-003-SLOW"""
     try:
         delay_ms = int(request.args.get('delay_ms', '5000'))
     except ValueError:
         delay_ms = 5000
 
-    # Clamp to valid range
     delay_ms = max(100, min(delay_ms, MAX_DELAY))
 
     log_test_hit("slow_body", request.method, request.path, 200,
-                 delay_profile=f"{delay_ms}ms")
+                 delay_profile=f"{delay_ms}ms", resilience_id="SAFE-003-SLOW")
 
     def generate():
         for chunk in generate_slow_body(delay_ms):
@@ -571,18 +332,14 @@ def slow_body():
     )
 
 
-# ============================================================================
-# Gzip Bomb
-# ============================================================================
-@app.route('/hostile/gzip-bomb')
-def gzip_bomb():
-    """Returns gzip-compressed response (~10KB compressed → ~10MB decompressed). SAFE-003"""
+def handle_gzip_bomb():
+    """Returns gzip-compressed response (~10KB compressed → ~10MB decompressed). SAFE-003 / SAFE-003-GZIP"""
     decompressed_size = MAX_GZIP_DECOMPRESSED
-    estimated_compressed_size = 10 * 1024  # zeros gzip to ~10 KB; estimate only, not a Content-Length guarantee
+    estimated_compressed_size = 10 * 1024
 
     log_test_hit("gzip_bomb", request.method, request.path, 200,
                  body_size=estimated_compressed_size,
-                 delay_profile=f"{decompressed_size}B decompressed")
+                 delay_profile=f"{decompressed_size}B decompressed", resilience_id="SAFE-003-GZIP")
 
     def generate():
         for chunk in generate_gzip_bomb_stream(decompressed_size):
@@ -598,14 +355,10 @@ def gzip_bomb():
     )
 
 
-# ============================================================================
-# Read-Only Observer
-# ============================================================================
-@app.route('/hostile/read-only', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
-def read_only():
+def handle_observer():
     """Records HTTP method, path, headers. Returns 200 with observation logged. SAFE-005"""
-    log_test_hit("read_only", request.method, request.path, 200)
-    log_observation("read_only", request.method, request.path, dict(request.headers))
+    log_test_hit("read_only", request.method, request.path, 200, resilience_id="SAFE-005")
+    log_observation("read_only", request.method, request.path, dict(request.headers), resilience_id="SAFE-005")
 
     return Response(
         "OK - Request observed and logged",
@@ -614,13 +367,10 @@ def read_only():
     )
 
 
-# ============================================================================
-# Kill Test (Connection Hold)
-# ============================================================================
-@app.route('/hostile/kill-test')
-def kill_test():
+def handle_kill_test():
     """Holds connection alive for 15 seconds then closes. SAFE-006"""
-    log_test_hit("kill_test", request.method, request.path, 200, delay_profile=f"{MAX_KILL_HOLD}s hold")
+    log_test_hit("kill_test", request.method, request.path, 200,
+                 delay_profile=f"{MAX_KILL_HOLD}s hold", resilience_id="SAFE-006")
 
     def generate():
         yield b"Connection held for 15 seconds...\n"
@@ -633,9 +383,147 @@ def kill_test():
     )
 
 
+def handle_ftp_redirect():
+    """302 redirect to FTP URL involving rebind-test. SAFE-008"""
+    dest = "ftp://rebind-test.paleon-lab-hostile.com/resource"
+    log_test_hit("ftp_redirect", request.method, request.path, 302, redirect_dest=dest, resilience_id="SAFE-008")
+    return redirect(dest, code=302)
+
+
+def handle_slow_drip():
+    """Streams exactly 1 byte every 10 seconds for up to 10 minutes. SAFE-009"""
+    log_test_hit("slow_drip", request.method, request.path, 200,
+                 delay_profile="1 byte / 10s (max 600s)", resilience_id="SAFE-009")
+
+    return Response(
+        stream_with_context(generate_slow_drip(interval_sec=SLOW_DRIP_INTERVAL, total_chunks=SLOW_DRIP_CHUNKS)),
+        mimetype='application/octet-stream'
+    )
+
+
+def handle_offscope_redirect():
+    """302 redirect to separate off-scope domain. SAFE-001"""
+    if not OFFSCOPE_DOMAIN:
+        return jsonify({"error": "OFFSCOPE_DOMAIN is not configured"}), 503
+    dest = f"https://{OFFSCOPE_DOMAIN}/"
+    log_test_hit("scope_escape", request.method, request.path, 302,
+                 redirect_dest=dest, off_scope=True, resilience_id="SAFE-001")
+    return redirect(dest, code=302)
+
+
+# Subdomain router mapping
+SUBDOMAIN_HANDLERS = {
+    "imds": handle_imds,
+    "fargate": handle_fargate,
+    "rfc1918": handle_rfc1918,
+    "loopback": handle_loopback,
+    "ipv6": handle_ipv6,
+    "redirect-loop": handle_redirect_loop,
+    "self-loop": handle_self_loop,
+    "large-body": handle_large_body,
+    "slow-body": handle_slow_body,
+    "gzip-body": handle_gzip_bomb,
+    "observer": handle_observer,
+    "kill-test": handle_kill_test,
+    "ftp-redirect": handle_ftp_redirect,
+    "slow-drip": handle_slow_drip,
+    "offscope-redirect": handle_offscope_redirect,
+}
+
+
 # ============================================================================
-# Internal Observation Endpoint (localhost only)
+# Landing Page & Operational Endpoints
 # ============================================================================
+
+def landing_page():
+    """Landing page documenting all dedicated hostile subdomains."""
+    domain = PRIMARY_DOMAIN
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Paleon Site 7 — Hostile Scanner Resilience Target</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            line-height: 1.6;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+            color: #1a1a1a;
+            background: #fafafa;
+        }}
+        header {{ margin-bottom: 2rem; }}
+        h1 {{ font-size: 1.8rem; font-weight: 600; margin-bottom: 0.5rem; }}
+        .subtitle {{ color: #666; font-size: 1.1rem; }}
+        .warning {{ background: #fff3cd; border: 1px solid #ffc107; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; }}
+        .warning strong {{ color: #856404; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 1rem; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05); }}
+        th, td {{ padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid #eee; }}
+        th {{ background: #f8f9fa; font-weight: 600; font-size: 0.9rem; }}
+        td code {{ background: #f1f3f5; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.85rem; font-family: monospace; }}
+        footer {{ margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #e0e0e0; color: #888; font-size: 0.85rem; }}
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Paleon Site 7 — Hostile Scanner Resilience Target</h1>
+        <p class="subtitle">Dedicated Subdomain Architecture for External Scanner Validation. <strong>Not for production use.</strong></p>
+    </header>
+
+    <div class="warning">
+        <strong>Passive Resilience Test Target:</strong> Paleon does not crawl links. Every hostile stimulus is hosted on its own dedicated subdomain where every path emits the stimulus.
+    </div>
+
+    <h2>Dedicated Subdomains</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Subdomain</th>
+                <th>Stimulus / Test</th>
+                <th>Resilience ID</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td><code>imds.{domain}</code></td><td>Redirect to EC2 IMDS metadata</td><td>SSRF-002</td></tr>
+            <tr><td><code>fargate.{domain}</code></td><td>Redirect to Fargate metadata</td><td>SSRF-001</td></tr>
+            <tr><td><code>rfc1918.{domain}</code></td><td>Redirect to RFC1918 private IPv4</td><td>SSRF-003</td></tr>
+            <tr><td><code>loopback.{domain}</code></td><td>Redirect to 127.0.0.1</td><td>SSRF-004</td></tr>
+            <tr><td><code>ipv6.{domain}</code></td><td>Redirect to [fd00::1] (ULA)</td><td>SSRF-004</td></tr>
+            <tr><td><code>redirect-loop.{domain}</code></td><td>3-cycle redirect chain</td><td>SAFE-002</td></tr>
+            <tr><td><code>self-loop.{domain}</code></td><td>Redirect to itself</td><td>SAFE-002</td></tr>
+            <tr><td><code>large-body.{domain}</code></td><td>Streaming 10MB body (max 20MB)</td><td>SAFE-003</td></tr>
+            <tr><td><code>slow-body.{domain}</code></td><td>Delayed chunk streaming</td><td>SAFE-003</td></tr>
+            <tr><td><code>gzip-body.{domain}</code></td><td>Gzip bomb (~10KB → ~10MB)</td><td>SAFE-003</td></tr>
+            <tr><td><code>observer.{domain}</code></td><td>Read-only passive observer (all methods 200)</td><td>SAFE-005</td></tr>
+            <tr><td><code>kill-test.{domain}</code></td><td>Connection hold for 15s then closes</td><td>SAFE-006</td></tr>
+            <tr><td><code>ftp-redirect.{domain}</code></td><td>Redirect to FTP URL on rebind-test</td><td>SAFE-008</td></tr>
+            <tr><td><code>slow-drip.{domain}</code></td><td>1 byte every 10s up to 10 minutes</td><td>SAFE-009</td></tr>
+            <tr><td><code>slow-tls.{domain}</code></td><td>Delayed TLS handshake (port 9997)</td><td>SAFE-010-TLS</td></tr>
+            <tr><td><code>malformed-http.{domain}</code></td><td>Raw malformed HTTP framing (port 9999)</td><td>SAFE-004</td></tr>
+            <tr><td><code>malformed-tls.{domain}</code></td><td>Raw garbled ServerHello (port 9998)</td><td>SAFE-004-TLS</td></tr>
+            <tr><td><code>offscope-redirect.{domain}</code></td><td>Redirect to separate off-scope domain</td><td>SAFE-001</td></tr>
+            <tr><td><code>rebind-test.{domain}</code></td><td>Authoritative DNS rebinding (port 53)</td><td>SAFE-007</td></tr>
+        </tbody>
+    </table>
+
+    <footer>
+        <p>PALEON SITE 7 — HOSTILE TEST TARGET — DO NOT USE FOR PRODUCTION</p>
+        <p>Health check: <code>/health</code> | Observation API: <code>/internal/site7-observation</code> (localhost only)</p>
+    </footer>
+</body>
+</html>"""
+    return Response(html, mimetype='text/html')
+
+
+@app.route('/health')
+def health():
+    """Local process health for bootstrap/ops. Not a scanner resilience test."""
+    return jsonify({"status": "ok", "service": "paleon-site7"}), 200
+
+
 @app.route('/internal/site7-observation')
 @localhost_only
 def internal_observation():
@@ -648,8 +536,30 @@ def internal_observation():
 
 
 # ============================================================================
+# Catch-all Route: Dispatches based on Host Header Subdomain
+# ============================================================================
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
+def catch_all(path):
+    """Catch-all dispatcher routing requests according to Host header subdomain."""
+    host = request.host.split(':')[0].lower()
+    subdomain = host.split('.')[0] if '.' in host else host
+
+    if subdomain in SUBDOMAIN_HANDLERS:
+        return SUBDOMAIN_HANDLERS[subdomain]()
+
+    # Handle apex domain or direct IP access
+    if path == 'health':
+        return health()
+    if path == 'internal/site7-observation':
+        return internal_observation()
+
+    return landing_page()
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 if __name__ == '__main__':
-    # This is a hostile test target - bind to localhost for Nginx proxying
+    # Bind to localhost for Nginx proxying
     app.run(host='127.0.0.1', port=MAIN_PORT, threaded=True)

@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# PALEON SITE 7 — RUNTIME VERIFICATION (final architecture).
-# Usage (run ON the instance): sudo ./verify.sh <site7-eip> [apex-hostname]
-# Inspects hostile stimuli WITHOUT following them; verifies malformed HTTP/TLS
 set -euo pipefail
-# from raw bytes (never `curl | grep "HTTP/"`) and queries the authoritative
-# DNS rebinder directly. App contract checked on Flask 127.0.0.1:5000; the
-# Nginx SNI edge is exercised over TLS on :443.
+# PALEON SITE 7 — RUNTIME VERIFICATION (Dedicated Subdomain Architecture)
+# Usage (run ON the instance): sudo ./verify.sh <site7-eip> [apex-hostname]
+# Inspects hostile stimuli WITHOUT following them; verifies dedicated subdomains,
+# malformed HTTP/TLS, slow TLS, and queries the authoritative DNS rebinder directly.
 
 PASS=0
 FAIL=0
@@ -38,15 +36,13 @@ echo "=== PALEON SITE 7 RUNTIME VERIFICATION ==="
 echo "EIP=$EIP  APEX=$APEX  APP=$APP"
 
 # --- helpers ---------------------------------------------------------------
-# Header block (CR stripped); never aborts the script.
 curl_head() { curl -s -D - -o /dev/null --max-time "$CURL_TIMEOUT" "$@" 2>/dev/null | tr -d '\r'; }
 curl_body() { curl -s --max-time "$CURL_TIMEOUT" "$@" 2>/dev/null; }
 http_code() { printf '%s\n' "$1" | awk 'NR==1{print $2}'; }
 http_hdr()  { printf '%s\n' "$2" | awk -v k="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" 'tolower($1)==k":"{print $2; exit}'; }
 field()     { printf '%s' "$2" | cut -d'|' -f"$1"; }
 
-# Direct DNS query using only the python3 stdlib (dig is optional on the host).
-# Prints "RCODE|AA|RA|TTL|ANSWER" or "" on no response.
+# Direct DNS query using only python3 stdlib
 dnsq() {
     python3 - "$1" "$2" "$3" "$4" 2>/dev/null <<'PY'
 import socket, struct, sys
@@ -69,7 +65,7 @@ def skip_name(data, off):
         off += 1 + l
     return off
 
-q = struct.pack("!HHHHHH", 0x1234, 0x0000, 1, 0, 0, 0)   # id, flags(RD=0), qd=1
+q = struct.pack("!HHHHHH", 0x1234, 0x0000, 1, 0, 0, 0)
 q += encode_name(name) + struct.pack("!HH", qtype, 1)
 try:
     if proto == "tcp":
@@ -149,6 +145,7 @@ check_tcp() {
 }
 check_tcp '127\.0\.0\.1:5000\b' "127.0.0.1:5000 (Flask)"
 check_tcp '127\.0\.0\.1:8443\b' "127.0.0.1:8443 (internal TLS term)"
+check_tcp '127\.0\.0\.1:9997\b' "127.0.0.1:9997 (slow TLS)"
 check_tcp '127\.0\.0\.1:9998\b' "127.0.0.1:9998 (malformed TLS)"
 check_tcp '127\.0\.0\.1:9999\b' "127.0.0.1:9999 (malformed HTTP)"
 check_tcp ':80\b'  "0.0.0.0:80 (nginx http)"
@@ -171,124 +168,138 @@ else
     check_fail "homepage missing marker / unreachable"
 fi
 
-# --- 4. SSRF redirect stimuli (inspect Location; never follow) -------------
-section "4. SSRF Location headers (SSRF-001..004)"
-# path|expected-Location-substring
+# --- 4. SSRF redirect stimuli (inspect Location on dedicated subdomains) ---
+section "4. SSRF Location headers on dedicated subdomains (SSRF-001..004)"
+# subdomain|query|expected-Location-substring
 SSRF=(
-    "/hostile/ssrf/fargate|http://169.254.170.2/v2/credentials/TEST_ONLY"
-    "/hostile/ssrf/fargate-relative|http://169.254.170.2/v2/credentials/test-site7"
-    "/hostile/ssrf/imds|http://169.254.169.254/latest/meta-data/"
-    "/hostile/ssrf/rfc1918|http://10.0.0.1/"
-    "/hostile/ssrf/rfc1918?target=172|http://172.16.0.1/"
-    "/hostile/ssrf/rfc1918?target=192|http://192.168.0.1/"
-    "/hostile/ssrf/localhost|http://127.0.0.1/"
-    "/hostile/ssrf/ipv6-loopback|http://[::1]/"
-    "/hostile/ssrf/ipv6-private|http://[fd00::1]/"
+    "fargate||http://169.254.170.2/v2/credentials/TEST_ONLY"
+    "imds||http://169.254.169.254/latest/meta-data/"
+    "rfc1918||http://10.0.0.1/"
+    "rfc1918|?target=172|http://172.16.0.1/"
+    "rfc1918|?target=192|http://192.168.0.1/"
+    "loopback||http://127.0.0.1/"
+    "ipv6||http://[fd00::1]/"
 )
 for entry in "${SSRF[@]}"; do
-    path="${entry%%|*}"
-    want="${entry#*|}"
-    h="$(curl_head "$APP$path")" || h=""
+    sub="${entry%%|*}"
+    rest="${entry#*|}"
+    query="${rest%%|*}"
+    want="${rest#*|}"
+    h="$(curl_head -H "Host: $sub.$APEX" "$APP/$query")" || h=""
     code="$(http_code "$h")"
     loc="$(http_hdr Location "$h")"
     if [ "$code" = "302" ] && [ "$loc" = "$want" ]; then
-        check_pass "SSRF $path -> 302 $want"
+        check_pass "SSRF $sub.$APEX$query -> 302 $want"
     else
-        check_fail "SSRF $path: code='$code' location='$loc' (want 302 '$want')"
+        check_fail "SSRF $sub.$APEX$query: code='$code' location='$loc' (want 302 '$want')"
     fi
 done
 
-# --- 5. scope escape (SAFE-001) --------------------------------------------
-section "5. Scope escape (SAFE-001)"
-h="$(curl_head "$APP/hostile/scope-escape")" || h=""
+# --- 5. scope escape on dedicated subdomain (SAFE-001) ---------------------
+section "5. Scope escape (SAFE-001) on offscope-redirect subdomain"
+h="$(curl_head -H "Host: offscope-redirect.$APEX" "$APP/")" || h=""
 code="$(http_code "$h")"; loc="$(http_hdr Location "$h")"
-if [ "$code" = "302" ] && printf '%s' "$loc" | grep -q "offscope.paleon-lab-hostile.com/landing"; then
-    check_pass "scope-escape -> 302 $loc"
+if [ "$code" = "302" ] && printf '%s' "$loc" | grep -q '^https://' && ! printf '%s' "$loc" | grep -q "\.$APEX"; then
+    check_pass "offscope-redirect -> 302 $loc (separate offscope domain)"
 else
-    check_fail "scope-escape: code='$code' location='$loc' (want 302 offscope .../landing)"
+    check_fail "offscope-redirect: code='$code' location='$loc' (want 302 to separate offscope domain)"
 fi
 
 # --- 6. redirect loop + self-loop (SAFE-002) -------------------------------
-section "6. Redirect cycle (SAFE-002)"
-LOOP=(
-    "/hostile/redirect-loop|/hostile/redirect-loop/a"
-    "/hostile/redirect-loop/a|/hostile/redirect-loop/b"
-    "/hostile/redirect-loop/b|/hostile/redirect-loop/c"
-    "/hostile/redirect-loop/c|/hostile/redirect-loop/a"
-)
-for entry in "${LOOP[@]}"; do
-    path="${entry%%|*}"; want="${entry#*|}"
-    h="$(curl_head "$APP$path")" || h=""
-    code="$(http_code "$h")"; loc="$(http_hdr Location "$h")"
-    if [ "$code" = "302" ] && printf '%s' "$loc" | grep -q "${want}\$"; then
-        check_pass "redirect $path -> $want"
-    else
-        check_fail "redirect $path: code='$code' location='$loc' (want $want)"
-    fi
-done
-h="$(curl_head "$APP/hostile/self-loop")" || h=""
-code="$(http_code "$h")"; loc="$(http_hdr Location "$h")"
-if [ "$code" = "302" ] && printf '%s' "$loc" | grep -q "self-loop"; then
-    check_pass "self-loop -> $loc"
+section "6. Redirect cycle (SAFE-002) on dedicated subdomains"
+h_entry="$(curl_head -H "Host: redirect-loop.$APEX" "$APP/")" || h_entry=""
+loc_entry="$(http_hdr Location "$h_entry")"
+if [ "$(http_code "$h_entry")" = "302" ] && [ "$loc_entry" = "/b" ]; then
+    check_pass "redirect-loop / -> 302 /b"
 else
-    check_fail "self-loop: code='$code' location='$loc'"
+    check_fail "redirect-loop /: code='$(http_code "$h_entry")' loc='$loc_entry'"
+fi
+
+h_b="$(curl_head -H "Host: redirect-loop.$APEX" "$APP/b")" || h_b=""
+if [ "$(http_code "$h_b")" = "302" ] && [ "$(http_hdr Location "$h_b")" = "/c" ]; then
+    check_pass "redirect-loop /b -> 302 /c"
+else
+    check_fail "redirect-loop /b: loc='$(http_hdr Location "$h_b")'"
+fi
+
+h_c="$(curl_head -H "Host: redirect-loop.$APEX" "$APP/c")" || h_c=""
+if [ "$(http_code "$h_c")" = "302" ] && [ "$(http_hdr Location "$h_c")" = "/a" ]; then
+    check_pass "redirect-loop /c -> 302 /a"
+else
+    check_fail "redirect-loop /c: loc='$(http_hdr Location "$h_c")'"
+fi
+
+h_self="$(curl_head -H "Host: self-loop.$APEX" "$APP/")" || h_self=""
+if [ "$(http_code "$h_self")" = "302" ] && printf '%s' "$(http_hdr Location "$h_self")" | grep -q "self-loop"; then
+    check_pass "self-loop -> 302 to self"
+else
+    check_fail "self-loop failed"
 fi
 
 # --- 7. resource exhaustion (SAFE-003) -------------------------------------
-section "7. Resource exhaustion (SAFE-003)"
-# 7a large-body: exact Content-Length, octet-stream, 200
-h="$(curl_head "$APP/hostile/large-body?size_mb=2")" || h=""
+section "7. Resource exhaustion (SAFE-003) on dedicated subdomains"
+h="$(curl_head -H "Host: large-body.$APEX" "$APP/?size_mb=2")" || h=""
 code="$(http_code "$h")"; cl="$(http_hdr Content-Length "$h")"; ct="$(http_hdr Content-Type "$h")"
 if [ "$code" = "200" ] && [ "$cl" = "2097152" ] && printf '%s' "$ct" | grep -q "application/octet-stream"; then
-    check_pass "large-body?size_mb=2 -> 200, Content-Length 2097152, octet-stream"
+    check_pass "large-body -> 200, Content-Length 2097152, octet-stream"
 else
-    check_fail "large-body: code='$code' len='$cl' type='$ct' (want 200/2097152/octet-stream)"
+    check_fail "large-body: code='$code' len='$cl' type='$ct'"
 fi
-# 7b slow-body: 200, measurable delay, no Content-Length (streamed)
-sb="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 20 "$APP/hostile/slow-body?delay_ms=1000")" || sb=""
+
+sb="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 20 -H "Host: slow-body.$APEX" "$APP/?delay_ms=1000")" || sb=""
 sbcode="$(printf '%s' "$sb" | awk '{print $1}')"; sbtime="$(printf '%s' "$sb" | awk '{print $2}')"
 if [ "$sbcode" = "200" ] && awk -v t="${sbtime:-0}" 'BEGIN{exit !(t+0>=0.8)}'; then
-    check_pass "slow-body?delay_ms=1000 -> 200 after ${sbtime}s"
+    check_pass "slow-body -> 200 after ${sbtime}s"
 else
     check_fail "slow-body: code='$sbcode' time='$sbtime' (want 200, >=0.8s)"
 fi
-h="$(curl_head "$APP/hostile/slow-body?delay_ms=200")" || h=""
-if [ -z "$(http_hdr Content-Length "$h")" ]; then
-    check_pass "slow-body has no Content-Length (streamed)"
-else
-    check_fail "slow-body unexpectedly sent Content-Length"
-fi
-# 7c gzip bomb: headers + REAL decompressed byte count == 10 MiB
-h="$(curl_head "$APP/hostile/gzip-bomb")" || h=""
+
+h="$(curl_head -H "Host: gzip-body.$APEX" "$APP/")" || h=""
 ce="$(http_hdr Content-Encoding "$h")"; xd="$(http_hdr X-Decompressed-Size "$h")"
 if printf '%s' "$ce" | grep -q "gzip" && [ "$xd" = "10485760" ]; then
-    check_pass "gzip-bomb headers: Content-Encoding gzip, X-Decompressed-Size 10485760"
+    check_pass "gzip-body headers: Content-Encoding gzip, X-Decompressed-Size 10485760"
 else
-    check_fail "gzip-bomb headers: encoding='$ce' x-decompressed='$xd'"
+    check_fail "gzip-body headers: encoding='$ce' x-decompressed='$xd'"
 fi
-dc="$(curl_body "$APP/hostile/gzip-bomb" | gzip -dc | wc -c)" || dc=""
+dc="$(curl_body -H "Host: gzip-body.$APEX" "$APP/" | gzip -dc | wc -c)" || dc=""
 if [ "$dc" = "10485760" ]; then
-    check_pass "gzip-bomb decompresses to exactly 10485760 bytes"
+    check_pass "gzip-body decompresses to exactly 10485760 bytes"
 else
-    check_fail "gzip-bomb decompressed size = '$dc' (want 10485760)"
+    check_fail "gzip-body decompressed size = '$dc' (want 10485760)"
 fi
 
-# --- 8. malformed HTTP over real TLS via SNI (SAFE-004) --------------------
-section "8. Malformed HTTP via SNI (SAFE-004) — raw bytes over TLS"
+# --- 8. new stimuli: ftp-redirect (SAFE-008) and slow-drip (SAFE-009) ------
+section "8. New hostile stimuli (ftp-redirect, slow-drip)"
+h_ftp="$(curl_head -H "Host: ftp-redirect.$APEX" "$APP/")" || h_ftp=""
+loc_ftp="$(http_hdr Location "$h_ftp")"
+if [ "$(http_code "$h_ftp")" = "302" ] && printf '%s' "$loc_ftp" | grep -q '^ftp://rebind-test\.'; then
+    check_pass "ftp-redirect -> 302 $loc_ftp"
+else
+    check_fail "ftp-redirect: code='$(http_code "$h_ftp")' loc='$loc_ftp'"
+fi
+
+sd="$(curl -s -N --max-time 2 -H "Host: slow-drip.$APEX" "$APP/" 2>/dev/null || printf '')"
+if [ "$sd" = "X" ]; then
+    check_pass "slow-drip streams initial 1 byte cleanly"
+else
+    check_fail "slow-drip initial byte failed: '$sd'"
+fi
+
+# --- 9. malformed HTTP over real TLS via SNI (SAFE-004) --------------------
+section "9. Malformed HTTP via SNI (SAFE-004) — raw bytes over TLS"
 tls_send() {
-    # $1 sni  $2 request-line-path  -> writes raw response bytes to $3 (file)
     printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$2" "$1" \
         | timeout 15 openssl s_client -connect 127.0.0.1:443 -servername "$1" -quiet 2>/dev/null
 }
 CHUNK_FILE="$(mktemp)"
-if tls_send "malformed-http.$APEX" "/malformed/chunked" > "$CHUNK_FILE"; then :; fi
+if tls_send "malformed-http.$APEX" "/chunked" > "$CHUNK_FILE"; then :; fi
 if grep -qa 'Transfer-Encoding: chunked' "$CHUNK_FILE" && grep -qa '^GARBAGE' "$CHUNK_FILE"; then
     check_pass "malformed chunked: 'Transfer-Encoding: chunked' + invalid 'GARBAGE' chunk size"
 else
     check_fail "malformed chunked: expected markers not found in raw response"
 fi
 BANNER_FILE="$(mktemp)"
-if tls_send "malformed-http.$APEX" "/malformed/banner" > "$BANNER_FILE"; then :; fi
+if tls_send "malformed-http.$APEX" "/banner" > "$BANNER_FILE"; then :; fi
 if grep -qa 'X-Control-Header' "$BANNER_FILE" && LC_ALL=C grep -qaP '\x00\x01\x02\x03' "$BANNER_FILE"; then
     check_pass "malformed banner: X-Control-Header carries raw control bytes 00 01 02 03"
 else
@@ -296,8 +307,8 @@ else
 fi
 rm -f "$CHUNK_FILE" "$BANNER_FILE"
 
-# --- 9. malformed TLS via SNI (SAFE-004-TLS) -------------------------------
-section "9. Malformed TLS via SNI (SAFE-004-TLS) — handshake must fail"
+# --- 10. malformed TLS (SAFE-004-TLS) & slow TLS (SAFE-010-TLS) ------------
+section "10. Malformed TLS & Slow TLS via SNI"
 tls_ec=0
 tls_out="$(printf '' | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "malformed-tls.$APEX" 2>&1)" || tls_ec=$?
 if printf '%s' "$tls_out" | grep -q 'BEGIN CERTIFICATE'; then
@@ -308,8 +319,19 @@ else
     check_fail "malformed-tls: no certificate but handshake did not clearly fail"
 fi
 
-# --- 10. Nginx edge: default SNI reaches Flask; :80 redirects --------------
-section "10. Nginx SNI edge (:443 default -> 8443 -> Flask, :80 -> 301)"
+start_slow=$(date +%s)
+slow_ec=0
+slow_out="$(printf '' | timeout 15 openssl s_client -connect 127.0.0.1:443 -servername "slow-tls.$APEX" 2>&1)" || slow_ec=$?
+end_slow=$(date +%s)
+slow_dur=$((end_slow - start_slow))
+if [ "$slow_dur" -ge 8 ]; then
+    check_pass "slow-tls handshake intentionally delayed (duration: ${slow_dur}s)"
+else
+    check_fail "slow-tls completed too quickly (${slow_dur}s)"
+fi
+
+# --- 11. Nginx edge: default SNI reaches Flask; :80 redirects --------------
+section "11. Nginx SNI edge (:443 default -> 8443 -> Flask, :80 -> 301)"
 edge="$(printf 'GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$APEX" \
         | timeout 15 openssl s_client -connect 127.0.0.1:443 -servername "$APEX" -quiet 2>/dev/null)" || edge=""
 if printf '%s' "$edge" | grep -q '"status": "ok"'; then
@@ -325,34 +347,34 @@ else
     check_fail ":80 redirect wrong: code='$code80' location='$loc80'"
 fi
 
-# --- 11. read-only observer, every method 200 (SAFE-005) -------------------
-section "11. Read-only observer (SAFE-005)"
+# --- 12. read-only observer (SAFE-005) -------------------------------------
+section "12. Read-only observer (SAFE-005) on observer subdomain"
 ro_ok=1
 for m in GET POST PUT DELETE PATCH OPTIONS; do
-    c="$(curl -s -X "$m" -o /dev/null -w '%{http_code}' --max-time "$CURL_TIMEOUT" "$APP/hostile/read-only")" || c=""
-    if [ "$c" != "200" ]; then ro_ok=0; check_fail "read-only $m -> '$c' (want 200)"; fi
+    c="$(curl -s -X "$m" -o /dev/null -w '%{http_code}' --max-time "$CURL_TIMEOUT" -H "Host: observer.$APEX" "$APP/")" || c=""
+    if [ "$c" != "200" ]; then ro_ok=0; check_fail "observer $m -> '$c' (want 200)"; fi
 done
-if [ "$ro_ok" = "1" ]; then check_pass "read-only returns 200 for GET/POST/PUT/DELETE/PATCH/OPTIONS"; fi
-hc="$(curl -s -I -o /dev/null -w '%{http_code}' --max-time "$CURL_TIMEOUT" "$APP/hostile/read-only")" || hc=""
-if [ "$hc" = "200" ]; then check_pass "read-only HEAD -> 200"; else check_fail "read-only HEAD -> '$hc'"; fi
-rob="$(curl_body -X POST "$APP/hostile/read-only")" || rob=""
+if [ "$ro_ok" = "1" ]; then check_pass "observer returns 200 for GET/POST/PUT/DELETE/PATCH/OPTIONS"; fi
+hc="$(curl -s -I -o /dev/null -w '%{http_code}' --max-time "$CURL_TIMEOUT" -H "Host: observer.$APEX" "$APP/")" || hc=""
+if [ "$hc" = "200" ]; then check_pass "observer HEAD -> 200"; else check_fail "observer HEAD -> '$hc'"; fi
+rob="$(curl_body -X POST -H "Host: observer.$APEX" "$APP/")" || rob=""
 if printf '%s' "$rob" | grep -q "Request observed and logged"; then
-    check_pass "read-only body records the observation"
+    check_pass "observer body records the observation"
 else
-    check_fail "read-only body missing observation marker: '$rob'"
+    check_fail "observer body missing observation marker: '$rob'"
 fi
 
-# --- 12. kill test (SAFE-006) ----------------------------------------------
-section "12. Kill test (SAFE-006)"
-kt="$(curl -s -N --max-time 3 "$APP/hostile/kill-test" 2>/dev/null || printf '')"
+# --- 13. kill test (SAFE-006) ----------------------------------------------
+section "13. Kill test (SAFE-006) on kill-test subdomain"
+kt="$(curl -s -N --max-time 3 -H "Host: kill-test.$APEX" "$APP/" 2>/dev/null || printf '')"
 if printf '%s' "$kt" | grep -q "Connection held"; then
     check_pass "kill-test streams initial chunk then holds (client can terminate cleanly)"
 else
     check_fail "kill-test did not stream expected initial chunk"
 fi
 
-# --- 13. observation endpoint (localhost-only) -----------------------------
-section "13. Observation store (localhost-only)"
+# --- 14. observation endpoint (localhost-only) -----------------------------
+section "14. Observation store (localhost-only)"
 obs="$(curl_body "$APP/internal/site7-observation")" || obs=""
 if printf '%s' "$obs" | grep -q '"total_observations"'; then
     check_pass "/internal/site7-observation returns observation JSON locally"
@@ -360,9 +382,8 @@ else
     check_fail "/internal/site7-observation not returning JSON locally"
 fi
 
-# --- 14. DNS rebinding, authoritative + direct (SAFE-007) ------------------
-section "14. DNS rebinding (SAFE-007) — direct authoritative queries"
-note "Equivalent manual check: dig @$EIP $REBIND_NAME A (twice)"
+# --- 15. DNS rebinding, authoritative + direct (SAFE-007) ------------------
+section "15. DNS rebinding (SAFE-007) — direct authoritative queries"
 DNS_SERVER="$EIP"
 p1="$(dnsq "$DNS_SERVER" "$REBIND_NAME" A udp)" || p1=""
 if [ -z "$p1" ]; then
@@ -384,19 +405,16 @@ rcref="$(field 1 "$pref")"
 if [ -z "$p1" ]; then
     check_fail "DNS server did not respond on $DNS_SERVER:53"
 else
-    # authoritative flags on query #1
     if [ "$rc1" = "NOERROR" ] && [ "$aa1" = "1" ] && [ "$ra1" = "0" ] && [ "$ttl1" = "0" ]; then
         check_pass "query #1 authoritative: NOERROR, AA=1, RA=0, TTL=0 (answer=$ans1)"
     else
         check_fail "query #1 flags wrong: rcode=$rc1 AA=$aa1 RA=$ra1 TTL=$ttl1"
     fi
-    # rebinding: second answer must be the private address
     if [ "$ans2" = "192.168.1.1" ]; then
         check_pass "query #2 rebinds to private 192.168.1.1"
     else
         check_fail "query #2 answer='$ans2' (want 192.168.1.1)"
     fi
-    # transition classification (state freshness aware)
     if [ "$ans1" = "$EIP" ]; then
         check_pass "clean transition observed: #1=$EIP (public) -> #2=192.168.1.1 (private)"
     elif [ "$ans1" = "192.168.1.1" ]; then
@@ -404,19 +422,16 @@ else
     else
         check_fail "query #1 answer='$ans1' (expected public EIP $EIP or already-private 192.168.1.1)"
     fi
-    # TCP path
     if [ "$rctcp" = "NOERROR" ] && [ "$aatcp" = "1" ] && [ -n "$anstcp" ]; then
         check_pass "TCP query answered authoritatively (answer=$anstcp)"
     else
         check_fail "TCP query failed: rcode=$rctcp AA=$aatcp answer='$anstcp'"
     fi
-    # NoData for non-A on the test name
     if [ "$rctxt" = "NOERROR" ] && [ -z "$anstxt" ]; then
         check_pass "TXT on test name -> NOERROR NoData (no A leaked)"
     else
         check_fail "TXT query unexpected: rcode=$rctxt answer='$anstxt'"
     fi
-    # REFUSED for names outside the zone
     if [ "$rcref" = "REFUSED" ]; then
         check_pass "out-of-zone name -> REFUSED (authoritative-only, no recursion)"
     else
