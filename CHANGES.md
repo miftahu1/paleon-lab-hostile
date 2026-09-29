@@ -2,6 +2,10 @@
 
 ## Current repository review
 
+- Aligned scanner answer-key expectations with current Paleon behavior: standard self-redirect limits, no gzip body decompression, DNS address pinning, TCP-only port scanning, final-200-only security-header checks, and Medium SPF/DMARC severity without mail infrastructure.
+- Recorded the live registrar transfer-lock check requirements and marked SAFE-006 skipped until a running-scan stop control is available.
+- Clarified that guessed exposed-file findings on the uniform-200 observer are false positives.
+
 - Documented the non-crawling scanner model: fixed paths, dedicated hostname per stimulus, Host-header dispatch, and response consistency across paths.
 - Added FTP redirect, bounded slow-drip and slow-TLS fixtures, and retained malformed protocol fixtures.
 - Ensured Nginx streams hostile responses without proxy buffering, sets finite 660 second timeouts, and blocks the operator observation endpoint on public HTTPS.

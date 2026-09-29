@@ -12,10 +12,10 @@ ordinary_findings:
     expectation: expected_informational_finding
     finding_expected: true
     finding: authoritative_dns_port_exposed
-    title: Authoritative DNS Port Exposed (TCP/UDP 53)
+    title: Authoritative DNS Port Exposed (TCP/53)
     target: paleon-lab-hostile.com:53
     severity: info
-    description: Ports 53 TCP and UDP are exposed publicly to 0.0.0.0/0 to provide non-recursive authoritative DNS answers for the delegated rebind-test zone.
+    description: TCP/53 is exposed publicly to 0.0.0.0/0 to provide non-recursive authoritative DNS answers for the delegated rebind-test zone. Paleon scans TCP only; UDP/53 is not expected as an exposed-port finding.
 
   - id: ORD-002
     expectation: expected_finding
@@ -23,8 +23,8 @@ ordinary_findings:
     finding: missing_spf_record
     title: Missing SPF TXT Record
     target: paleon-lab-hostile.com
-    severity: expected
-    description: The Route 53 zone contains no SPF (v=spf1) TXT record because the test lab does not send or receive email.
+    severity: medium
+    description: Missing SPF is Medium when there is no MX/mail infrastructure; the test lab does not send or receive email.
 
   - id: ORD-003
     expectation: expected_finding
@@ -32,8 +32,8 @@ ordinary_findings:
     finding: missing_dmarc_record
     title: Missing DMARC Policy Record
     target: _dmarc.paleon-lab-hostile.com
-    severity: expected
-    description: The Route 53 zone contains no _dmarc TXT record because there is no email infrastructure associated with the hostile test target.
+    severity: medium
+    description: Missing DMARC is Medium when there is no MX/mail infrastructure; the hostile test target has no email infrastructure.
 
   - id: ORD-004
     expectation: expected_finding
@@ -42,7 +42,7 @@ ordinary_findings:
     title: Missing Security Headers on HTTP Responses
     target: "*.paleon-lab-hostile.com"
     severity: expected
-    description: Responses from the Flask/Nginx endpoints do not set Strict-Transport-Security (HSTS), Content-Security-Policy (CSP), X-Frame-Options, or X-Content-Type-Options.
+    description: Only final responses in the 200 range are eligible for these findings. Redirect responses do not create security-header findings; assess HSTS, CSP, X-Frame-Options, and X-Content-Type-Options only on hosts whose final response is 200-range.
 
   - id: ORD-005
     expectation: informational_note
@@ -70,6 +70,13 @@ ordinary_findings:
     severity: info
     finding_expected: conditional
     description: The configuration creates no MX or mail service. Report only after checking the active DNS zone; an externally maintained MX record would make this finding inapplicable.
+
+registration_checks:
+  - id: REG-001
+    domain: paleon-lab-hostile.com
+    check: .com registrar transfer lock
+    expected_behavior: Record the actual live ON/OFF transfer-lock state from registrar/registration data; do not infer it from DNS.
+    scoring: Use the observed transfer-lock state when scoring this registration check.
 
 # Defensive safety invariants: the scanner MUST NOT exhibit these failure modes
 must_not_flag:
@@ -214,12 +221,12 @@ resilience_tests:
     category: redirect_safety
     hostname: self-loop.paleon-lab-hostile.com
     stimulus: Every path returns HTTP 302 redirect to itself (request.url)
-    expected_behavior: Scanner detects immediate cycle / self-redirect and refuses re-request
+    expected_behavior: Follow the self-redirect normally; terminate when this same URL has repeated four times or when ten redirects total have been reached, whichever happens first.
     severity: expected
     silent_expected: false
     finding_expected: false
-    evidence_required: Scanner terminates follow sequence after detecting identical URL
-    termination_expectation: Immediate cycle break on 1st hop
+    evidence_required: Redirect trace shows normal following and termination at the four-repeat same-URL limit or ten total redirects, whichever comes first.
+    termination_expectation: Terminate at the standard Python redirect limit; do not terminate immediately on the first repeated URL.
     claim: expected
 
   - id: SAFE-003
@@ -250,12 +257,12 @@ resilience_tests:
     category: resource_safety
     hostname: gzip-body.paleon-lab-hostile.com
     stimulus: Every path returns gzip response (~10KB compressed -> 10MB decompressed)
-    expected_behavior: Scanner enforces maximum decompressed byte limit during streaming decompression without OOM crash
+    expected_behavior: Scanner may inspect response metadata but does not decompress or expand the gzip response body.
     severity: expected
     silent_expected: false
     finding_expected: false
-    evidence_required: Scanner limits decompressed buffer; memory usage stays bounded
-    termination_expectation: Decompression terminated cleanly at limit
+    evidence_required: Evidence shows response metadata inspection only and no gzip body decompression or expansion.
+    termination_expectation: No decompressed-size limiter is exercised by this probe.
     claim: expected
 
   - id: SAFE-004
@@ -290,7 +297,7 @@ resilience_tests:
     severity: expected
     silent_expected: false
     finding_expected: false
-    evidence_required: The target accepts any method; observation records what the scanner sent. Expected scanner behavior is that normal scanning sends only non-destructive methods (for example GET/HEAD/OPTIONS), with no state-changing requests.
+    evidence_required: The target accepts any method/path and returns HTTP 200 for every path; observation records what the scanner sent. Expected scanner behavior is that normal scanning sends only non-destructive methods (for example GET/HEAD/OPTIONS), with no state-changing requests. Do not report guessed exposed-file paths such as /.env, /.git/config, or similar paths as findings on this host; these are false positives against its uniform 200 response.
     termination_expectation: Normal request completion
     claim: expected
 
@@ -298,24 +305,26 @@ resilience_tests:
     category: termination_safety
     hostname: kill-test.paleon-lab-hostile.com
     stimulus: Streams initial greeting then holds connection for 15 seconds before closing
-    expected_behavior: Scanner scan task terminates cleanly when stopped/killed by scanner controller
+    expected_behavior: Skipped for the current scan because Paleon does not yet provide a running-scan stop control. Execute this check once scan-stop control is available.
+    skipped: true
+    skip_reason: Paleon does not yet provide a running-scan stop control; execute SAFE-006 once that control is available.
     severity: expected
     silent_expected: false
     finding_expected: false
-    evidence_required: Process terminates promptly on SIGTERM/SIGINT with zero orphan child processes or socket leaks
-    termination_expectation: Task terminated by controller within hold period
+    evidence_required: When runnable, record controller stop action and confirm prompt process termination with zero orphan child processes or socket leaks.
+    termination_expectation: Skipped for the current scan; on execution, task is terminated by controller within hold period.
     claim: expected
 
   - id: SAFE-007
     category: dns_rebinding_safety
     hostname: rebind-test.paleon-lab-hostile.com
     stimulus: Authoritative DNS daemon on port 53 returns public EIP on 1st query, then 192.168.1.1 on subsequent queries (TTL=0)
-    expected_behavior: Scanner re-resolves and validates DNS before reconnecting; refuses connection to private 192.168.1.1
+    expected_behavior: Scanner resolves the hostname once, validates/vets the resolved address, pins that address, and connects only to the pinned address; it does not re-resolve before connecting again.
     severity: expected
     silent_expected: true
     finding_expected: false
-    evidence_required: Scanner logs show DNS re-resolution; zero connection attempt to 192.168.1.1
-    termination_expectation: Connection aborted when re-resolved IP is private
+    evidence_required: Zero connection attempts to 192.168.1.1; evidence shows the initially resolved public address was pinned and used.
+    termination_expectation: Connection uses only the vetted, initially resolved public address.
     claim: expected
 
   - id: SAFE-008

@@ -3,7 +3,7 @@
 | Port | Bind / service | Public | Role |
 |---|---|---|---|
 | 22/TCP | SSH | Admin CIDR only | Operator access |
-| 53/TCP+UDP | DNS daemon on `0.0.0.0` | Yes | Authoritative non-recursive rebinding fixture; normal expected informational finding |
+| 53/TCP+UDP | DNS daemon on `0.0.0.0` | Yes | Authoritative non-recursive rebinding fixture; Paleon scans TCP only, so TCP/53 alone is an expected exposed-port finding (not UDP/53) |
 | 80/TCP | Nginx | Yes | Redirects to HTTPS |
 | 443/TCP | Nginx stream SNI router | Yes | Normal HTTPS and hostile raw TLS/HTTP fixtures |
 | 5000/TCP | Flask `127.0.0.1` | No | Host-header dispatch, health and local observation API |
