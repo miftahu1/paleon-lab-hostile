@@ -180,12 +180,12 @@ resource "aws_instance" "paleon-site7" {
 
   # No IAM instance profile — intentionally minimal permissions.
 
-  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
+  user_data_base64 = base64gzip(templatefile("${path.module}/user_data.sh.tftpl", {
     domain_name        = var.hostname
     public_ip          = aws_eip.paleon-site7-eip.public_ip
     offscope_domain    = var.offscope_domain
     hostile_subdomains = local.hostile_subdomains
-  })
+  }))
   user_data_replace_on_change = true
 
   lifecycle {
