@@ -7,6 +7,7 @@ set -euo pipefail
 DOMAIN_NAME="${domain_name}"
 PUBLIC_IP="${public_ip}"
 OFFSCOPE_DOMAIN="${offscope_domain}"
+OFFSCOPE_LOG_SLUG=$(printf '%s' "$OFFSCOPE_DOMAIN" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9.-' '_')
 APP_DIR="/opt/paleon-site7"
 DATA_DIR="/var/lib/site7"
 LOG_FILE="/var/log/paleon-site7-bootstrap.log"
@@ -321,6 +322,7 @@ http {
     access_log /var/log/nginx/access.log;
     error_log /var/log/nginx/error.log;
     gzip off;
+    include /etc/nginx/conf.d/*.conf;
 
     # Internal HTTPS termination for normal hostile subdomains (SNI default backend)
     server {
@@ -365,6 +367,7 @@ http {
 # default terminates TLS at 8443 and HTTP-proxies to Flask (5000)
 stream {
     map $ssl_preread_server_name $backend_name {
+        include /etc/nginx/site7-offscope-map.conf;
         ~^malformed-tls\.    127.0.0.1:9998;
         ~^malformed-http\.   127.0.0.1:9999;
         ~^slow-tls\.         127.0.0.1:9997;
@@ -381,6 +384,76 @@ stream {
     }
 }
 NGINXEOF
+
+# The off-scope host has a distinct HTTP-01 webroot, TLS server block, sink
+# response, certificate paths, and access log. It never reaches Flask.
+mkdir -p /var/www/site7-acme/.well-known/acme-challenge /etc/nginx/conf.d
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+rm -f /etc/nginx/conf.d/site7-offscope-https.conf
+printf '%s 127.0.0.1:8444;\n' "$OFFSCOPE_DOMAIN" > /etc/nginx/site7-offscope-map.conf
+cat > /etc/letsencrypt/renewal-hooks/deploy/site7-nginx-reload << 'CERTRENEWEOF'
+#!/bin/sh
+systemctl reload nginx
+CERTRENEWEOF
+chmod 755 /etc/letsencrypt/renewal-hooks/deploy/site7-nginx-reload
+write_offscope_acme_config() {
+    cat > /etc/nginx/conf.d/site7-offscope.conf << NGINXOFFSCOPEEOF
+log_format offscope_audit '\$time_iso8601 \$remote_addr "\$request_method" "\$host" "\$request_uri" \$status \$request_time "\$http_user_agent"';
+
+server {
+    listen 80;
+    server_name $OFFSCOPE_DOMAIN;
+    access_log /var/log/nginx/$${OFFSCOPE_LOG_SLUG}_access.log offscope_audit;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/site7-acme;
+        default_type text/plain;
+    }
+    location / {
+        default_type text/plain;
+        return 503 "SAFE-001 unavailable: dedicated trusted certificate not issued\n";
+    }
+}
+NGINXOFFSCOPEEOF
+}
+write_offscope_ready_config() {
+    cat > /etc/nginx/conf.d/site7-offscope.conf << NGINXOFFSCOPEEOF
+log_format offscope_audit '\$time_iso8601 \$remote_addr "\$request_method" "\$host" "\$request_uri" \$status \$request_time "\$http_user_agent"';
+
+server {
+    listen 80;
+    server_name $OFFSCOPE_DOMAIN;
+    access_log /var/log/nginx/$${OFFSCOPE_LOG_SLUG}_access.log offscope_audit;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/site7-acme;
+        default_type text/plain;
+    }
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+NGINXOFFSCOPEEOF
+
+    cat > /etc/nginx/conf.d/site7-offscope-https.conf << NGINXOFFSCOPEEOF
+server {
+    listen 127.0.0.1:8444 ssl;
+    server_name $OFFSCOPE_DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/site7-offscope-$OFFSCOPE_LOG_SLUG/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/site7-offscope-$OFFSCOPE_LOG_SLUG/privkey.pem;
+    access_log /var/log/nginx/$${OFFSCOPE_LOG_SLUG}_access.log offscope_audit;
+
+    location = /internal/site7-observation { return 404; }
+    location / {
+        default_type text/plain;
+        return 200 "Site 7 off-scope sink\n";
+    }
+}
+NGINXOFFSCOPEEOF
+}
+OFFSCOPE_TLS_READY=false
+write_offscope_acme_config
 
 if ! nginx -t; then
     echo "[FATAL] Nginx configuration test failed after certificate setup"
@@ -408,6 +481,38 @@ NGINXUNITEOF
 systemctl daemon-reload
 systemctl start nginx
 systemctl enable nginx
+
+# Request the off-scope certificate independently, with Nginx serving the
+# HTTP-01 webroot challenge. HTTPS stays unavailable until trusted issuance
+# succeeds; the ordinary hostile certificate remains independent.
+echo "[10.1/12] Issuing dedicated OFFSCOPE_DOMAIN certificate..."
+set +e
+timeout 120s certbot certonly --webroot --webroot-path /var/www/site7-acme \
+    --non-interactive --agree-tos --email "admin@$DOMAIN_NAME" \
+    --cert-name "site7-offscope-$OFFSCOPE_LOG_SLUG" -d "$OFFSCOPE_DOMAIN"
+OFFSCOPE_CERTBOT_RC=$?
+set -e
+
+if [ "$OFFSCOPE_CERTBOT_RC" -eq 0 ] && \
+   [ -s "/etc/letsencrypt/live/site7-offscope-$OFFSCOPE_LOG_SLUG/fullchain.pem" ] && \
+   [ -s "/etc/letsencrypt/live/site7-offscope-$OFFSCOPE_LOG_SLUG/privkey.pem" ]; then
+    write_offscope_ready_config
+    if nginx -t && systemctl reload nginx; then
+        OFFSCOPE_TLS_READY=true
+        echo "[INFO] Dedicated OFFSCOPE_DOMAIN certificate installed"
+    else
+        echo "[FATAL] SAFE-001 is not deployment-ready: the dedicated trusted OFFSCOPE_DOMAIN certificate could not be activated"
+        rm -f /etc/nginx/conf.d/site7-offscope-https.conf
+        write_offscope_acme_config
+        if nginx -t && systemctl reload nginx; then
+            echo "[INFO] OFFSCOPE_DOMAIN remains unavailable with HTTP 503 and no HTTPS listener"
+        else
+            echo "[FATAL] Could not restore fail-closed OFFSCOPE_DOMAIN Nginx configuration"
+        fi
+    fi
+else
+    echo "[FATAL] SAFE-001 is not deployment-ready: dedicated trusted ACME certificate issuance failed for OFFSCOPE_DOMAIN (exit $OFFSCOPE_CERTBOT_RC); no self-signed certificate will be used"
+fi
 
 # Wait for services to stabilize
 sleep 3
@@ -475,6 +580,25 @@ systemctl start site7-egress-firewall.service
 # 11. Hardened Bootstrap Health Gate
 echo "[11/12] === RUNNING HARDENED HEALTH GATE ==="
 HEALTH_ERRORS=0
+
+if [ "$OFFSCOPE_TLS_READY" != true ]; then
+    echo "[FATAL] SAFE-001 health check failed: OFFSCOPE_DOMAIN has no active dedicated trusted ACME certificate"
+    HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+else
+    if ! ss -tlnp | grep -q '127.0.0.1:8444'; then
+        echo "[FATAL] SAFE-001 health check failed: dedicated OFFSCOPE_DOMAIN HTTPS listener is not active"
+        HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+    fi
+    if ! OFFSCOPE_HEALTH_RESPONSE=$(curl -fsS --max-time 5 \
+        --resolve "$OFFSCOPE_DOMAIN:8444:127.0.0.1" \
+        "https://$OFFSCOPE_DOMAIN:8444/"); then
+        echo "[FATAL] SAFE-001 health check failed: dedicated trusted HTTPS certificate or sink response is invalid"
+        HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+    elif [ "$OFFSCOPE_HEALTH_RESPONSE" != "Site 7 off-scope sink" ]; then
+        echo "[FATAL] SAFE-001 health check failed: dedicated HTTPS sink returned an unexpected response"
+        HEALTH_ERRORS=$((HEALTH_ERRORS + 1))
+    fi
+fi
 
 for svc in paleon-site7 site7-malformed-server site7-rebind-dns nginx; do
     if ! systemctl is-active --quiet "$svc"; then

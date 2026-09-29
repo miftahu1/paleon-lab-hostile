@@ -2,6 +2,8 @@
 
 ## Current repository review
 
+- Added a parameterized, isolated SAFE-001 off-scope Nginx sink with separate HTTP-01 webroot, required trusted ACME certificate, and User-Agent-bearing access log; documented external DNS and scan-window evidence.
+- Made trusted off-scope ACME issuance a bootstrap health prerequisite; issuance failure leaves the sink unavailable and fails the health gate instead of using self-signed TLS.
 - Aligned scanner answer-key expectations with current Paleon behavior: standard self-redirect limits, no gzip body decompression, DNS address pinning, TCP-only port scanning, final-200-only security-header checks, and Medium SPF/DMARC severity without mail infrastructure.
 - Recorded the live registrar transfer-lock check requirements and marked SAFE-006 skipped until a running-scan stop control is available.
 - Clarified that guessed exposed-file findings on the uniform-200 observer are false positives.

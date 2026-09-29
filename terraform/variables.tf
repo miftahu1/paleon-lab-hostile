@@ -53,12 +53,12 @@ variable "hostname" {
 }
 
 variable "offscope_domain" {
-  description = "Operator-supplied separate registered domain used only as SAFE-001 redirect target. Never verify it in Paleon or add it as business-context host."
+  description = "Operator-supplied separate registered domain used only as SAFE-001 redirect target and isolated sink hostname. Its public A record must point to the Site 7 EIP; never verify it in Paleon or add it as business-context host."
   type        = string
   default     = ""
   validation {
-    condition     = var.offscope_domain != "" && var.offscope_domain != var.hostname && !endswith(var.offscope_domain, ".${var.hostname}")
-    error_message = "offscope_domain must be populated with a separate registered domain outside the paleon-lab-hostile.com zone."
+    condition     = can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$", var.offscope_domain)) && var.offscope_domain != var.hostname && !endswith(var.offscope_domain, ".${var.hostname}")
+    error_message = "offscope_domain must be a valid DNS name for a separately registered domain outside the paleon-lab-hostile.com zone."
   }
 }
 

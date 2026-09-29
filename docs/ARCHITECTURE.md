@@ -27,6 +27,8 @@ Paleon discovers hosts and fetches root plus a fixed set of paths; it does not c
 
 `OFFSCOPE_DOMAIN` is a separate registered domain and is used only as the SAFE-001 redirect destination. It must never be verified in Paleon or added as a business-context host. It is operator-supplied; no purchased domain is encoded in this repository.
 
+The same parameter configures an isolated Nginx HTTP/HTTPS sink server block, a separate HTTP-01 certificate lifecycle, and a dedicated access log. It is not added to the hostile subdomain list or normal Site 7 certificate SANs. Its A record is managed externally at its own DNS provider and must resolve to the Site 7 EIP before certificate issuance.
+
 `rebind-test.paleon-lab-hostile.com` is DNS-only. `ns1.paleon-lab-hostile.com` is DNS infrastructure only. Neither is a certificate SAN: `rebind-test` intentionally alternates answers, while `ns1` does not host an ordinary HTTPS stimulus. Certificate SAN generation uses the centralized Terraform `hostile_subdomains` list plus the apex and excludes both names.
 
 ## Network layout

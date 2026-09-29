@@ -201,7 +201,8 @@ resilience_tests:
     severity: expected
     silent_expected: true
     finding_expected: false
-    evidence_required: Zero requests received by OFFSCOPE_DOMAIN; scanner scope logs show redirect destination flagged off-scope
+    pass_preconditions: OFFSCOPE_DOMAIN resolves to the Site 7 public EIP and is publicly reachable; it is not in Paleon business context and is not verified in Paleon; it has its own successfully issued trusted ACME certificate, Nginx server block, and access log. A self-signed certificate is not acceptable.
+    evidence_required: During the recorded scan window, zero requests attributable to the Paleon scan appear in the dedicated OFFSCOPE_DOMAIN access log, correlated with Paleon-side scope evidence. Unrelated internet requests do not fail this condition.
     termination_expectation: Immediate termination after domain scope check
     claim: expected
 
