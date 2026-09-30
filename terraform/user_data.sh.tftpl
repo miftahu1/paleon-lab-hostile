@@ -90,6 +90,9 @@ chmod 750 "$DATA_DIR"
 
 # 4. Deploy application from repository
 echo "[4/12] Cloning application repository..."
+if ! git config --global --get-all safe.directory | grep -Fxq "$APP_DIR"; then
+    git config --global --add safe.directory "$APP_DIR"
+fi
 if [ -d "$APP_DIR/.git" ]; then
     echo "Repository exists, pulling latest..."
     cd "$APP_DIR"
@@ -110,7 +113,7 @@ chown -R site7:site7 "$APP_DIR"
 
 # 5. Install Python dependencies
 echo "[5/12] Installing Python dependencies..."
-python3 -m pip install -r "$APP_DIR/deployed_requirements.txt" --quiet --break-system-packages >> "$LOG_FILE" 2>&1
+python3 -m pip install --ignore-installed -r "$APP_DIR/deployed_requirements.txt" --quiet --break-system-packages >> "$LOG_FILE" 2>&1
 
 # 6. Create systemd units
 echo "[6/12] Creating systemd service files..."
@@ -266,7 +269,7 @@ set -e
 
 if [ "$CERTBOT_RC" -eq 0 ] && [ -s "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" ] && [ -s "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" ]; then
     cp "/etc/letsencrypt/live/$DOMAIN_NAME/fullchain.pem" /etc/ssl/site7/site7.crt
-    cp "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" /etc/ssl/site7/site7.key
+    install -o root -g "$TLS_GROUP" -m 0640 "/etc/letsencrypt/live/$DOMAIN_NAME/privkey.pem" /etc/ssl/site7/site7.key
     CERT_SUCCESS=true
     echo "[INFO] Certbot certificate successfully issued with all hostile subdomains"
 else
@@ -289,13 +292,11 @@ chown "root:$TLS_GROUP" /etc/ssl/site7/site7.key
 chown root:root /etc/ssl/site7/site7.crt
 
 KEY_MODE=$(stat -c '%a' /etc/ssl/site7/site7.key)
+KEY_OWNER=$(stat -c '%U' /etc/ssl/site7/site7.key)
 KEY_GROUP=$(stat -c '%G' /etc/ssl/site7/site7.key)
-if [ "$KEY_MODE" != "640" ] || [ "$KEY_GROUP" != "$TLS_GROUP" ]; then
-    echo "[FATAL] TLS private key permissions incorrect: mode=$KEY_MODE group=$KEY_GROUP"
-    exit 1
-fi
-if [ "$((8#$KEY_MODE % 10))" -ne 0 ]; then
-    echo "[FATAL] TLS private key is world-readable"
+KEY_WORLD_READ=$(stat -c '%A' /etc/ssl/site7/site7.key | cut -c8)
+if [ "$KEY_MODE" != "640" ] || [ "$KEY_OWNER" != "root" ] || [ "$KEY_GROUP" != "$TLS_GROUP" ] || [ "$KEY_WORLD_READ" != "-" ]; then
+    echo "[FATAL] TLS private key permissions incorrect: mode=$KEY_MODE owner=$KEY_OWNER group=$KEY_GROUP world_read=$KEY_WORLD_READ"
     exit 1
 fi
 
@@ -389,7 +390,9 @@ NGINXEOF
 # response, certificate paths, and access log. It never reaches Flask.
 mkdir -p /var/www/site7-acme/.well-known/acme-challenge /etc/nginx/conf.d
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-rm -f /etc/nginx/conf.d/site7-offscope-https.conf
+rm -f /etc/nginx/conf.d/site7-offscope.conf \
+      /etc/nginx/conf.d/00-site7-offscope.conf \
+      /etc/nginx/conf.d/site7-offscope-https.conf
 printf '%s 127.0.0.1:8444;\n' "$OFFSCOPE_DOMAIN" > /etc/nginx/site7-offscope-map.conf
 cat > /etc/letsencrypt/renewal-hooks/deploy/site7-nginx-reload << 'CERTRENEWEOF'
 #!/bin/sh
@@ -397,7 +400,7 @@ systemctl reload nginx
 CERTRENEWEOF
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/site7-nginx-reload
 write_offscope_acme_config() {
-    cat > /etc/nginx/conf.d/site7-offscope.conf << NGINXOFFSCOPEEOF
+    cat > /etc/nginx/conf.d/00-site7-offscope.conf << NGINXOFFSCOPEEOF
 log_format offscope_audit '\$time_iso8601 \$remote_addr "\$request_method" "\$host" "\$request_uri" \$status \$request_time "\$http_user_agent"';
 
 server {
@@ -417,7 +420,7 @@ server {
 NGINXOFFSCOPEEOF
 }
 write_offscope_ready_config() {
-    cat > /etc/nginx/conf.d/site7-offscope.conf << NGINXOFFSCOPEEOF
+    cat > /etc/nginx/conf.d/00-site7-offscope.conf << NGINXOFFSCOPEEOF
 log_format offscope_audit '\$time_iso8601 \$remote_addr "\$request_method" "\$host" "\$request_uri" \$status \$request_time "\$http_user_agent"';
 
 server {
@@ -439,6 +442,7 @@ NGINXOFFSCOPEEOF
 server {
     listen 127.0.0.1:8444 ssl;
     server_name $OFFSCOPE_DOMAIN;
+    if (\$host != "$OFFSCOPE_DOMAIN") { return 421; }
 
     ssl_certificate /etc/letsencrypt/live/site7-offscope-$OFFSCOPE_LOG_SLUG/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/site7-offscope-$OFFSCOPE_LOG_SLUG/privkey.pem;

@@ -142,7 +142,14 @@ resource "aws_security_group" "paleon-site7-sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Default AWS egress (all outbound) is retained so bootstrap can apt/git.
+  egress {
+    description = "IPv4 egress for bootstrap and services"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # Application processes are later restricted on-host with iptables uid rules.
   tags = {
     Name = "${var.project_name}-sg"

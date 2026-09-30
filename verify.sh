@@ -41,6 +41,9 @@ curl_body() { curl -s --max-time "$CURL_TIMEOUT" "$@" 2>/dev/null; }
 http_code() { printf '%s\n' "$1" | awk 'NR==1{print $2}'; }
 http_hdr()  { printf '%s\n' "$2" | awk -v k="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" 'tolower($1)==k":"{print $2; exit}'; }
 field()     { printf '%s' "$2" | cut -d'|' -f"$1"; }
+health_payload_ok() {
+    printf '%s' "$1" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status") == "ok" and d.get("service") == "paleon-site7" else 1)' 2>/dev/null
+}
 
 # Direct DNS query using only python3 stdlib
 dnsq() {
@@ -156,7 +159,7 @@ if ss -ulnp 2>/dev/null | grep -qE ':53\b'; then check_pass "udp listener: 0.0.0
 # --- 3. health + homepage (Flask direct) -----------------------------------
 section "3. Health & homepage (Flask 127.0.0.1:5000)"
 hb="$(curl_body "$APP/health")" || hb=""
-if printf '%s' "$hb" | grep -q '"status": "ok"' && printf '%s' "$hb" | grep -q '"service": "paleon-site7"'; then
+if health_payload_ok "$hb"; then
     check_pass "/health -> {status: ok, service: paleon-site7}"
 else
     check_fail "/health payload wrong or unreachable: $hb"
@@ -332,9 +335,11 @@ fi
 
 # --- 11. Nginx edge: default SNI reaches Flask; :80 redirects --------------
 section "11. Nginx SNI edge (:443 default -> 8443 -> Flask, :80 -> 301)"
-edge="$(printf 'GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$APEX" \
-        | timeout 15 openssl s_client -connect 127.0.0.1:443 -servername "$APEX" -quiet 2>/dev/null)" || edge=""
-if printf '%s' "$edge" | grep -q '"status": "ok"'; then
+edge="$(curl -k -sS --max-time "$CURL_TIMEOUT" --resolve "$APEX:443:127.0.0.1" \
+        -w '|%{http_code}' "https://$APEX/health")" || edge=""
+edge_code="${edge##*|}"
+edge_body="${edge%|*}"
+if [ "$edge_code" = "200" ] && health_payload_ok "$edge_body"; then
     check_pass "default SNI ($APEX) terminates TLS on :443 and reaches Flask /health"
 else
     check_fail "default SNI path did not reach Flask /health over :443"

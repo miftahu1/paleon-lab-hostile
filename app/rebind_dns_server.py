@@ -2,7 +2,8 @@
 """
 PALEON SITE 7 — DNS Rebinding Test Server (SAFE-007)
 
-Listens on 0.0.0.0:53 TCP and UDP. Authoritative only for
+Listens on 0.0.0.0:53 UDP and the primary private IPv4 address:53 TCP.
+Authoritative only for
 rebind-test.paleon-lab-hostile.com. Recursion is never offered (RA=0, AA=1
 on answers for the test name).
 
@@ -22,6 +23,7 @@ and state counters for external correlation.
 """
 
 import ipaddress
+import fcntl
 import json
 import os
 import socket
@@ -43,6 +45,35 @@ MAX_CLIENTS = 100
 MAX_WORKERS = 10
 MAX_DNS_MESSAGE = 4096
 UDP_RECV = 512
+SIOCGIFADDR = 0x8915
+
+
+def get_primary_private_ipv4() -> str:
+    """Resolve the primary interface address from the kernel default route."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as routes:
+            candidates = []
+            next(routes)
+            for line in routes:
+                fields = line.split()
+                if len(fields) >= 8 and fields[1] == "00000000" and int(fields[3], 16) & 1:
+                    candidates.append((int(fields[6]), fields[0]))
+        if not candidates:
+            raise RuntimeError("no active IPv4 default route found")
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _metric, interface in sorted(candidates):
+                request = struct.pack("256s", interface.encode("ascii")[:15])
+                address = socket.inet_ntoa(fcntl.ioctl(probe.fileno(), SIOCGIFADDR, request)[20:24])
+                parsed = ipaddress.ip_address(address)
+                if parsed.version == 4 and parsed.is_private and not parsed.is_loopback:
+                    return address
+        finally:
+            probe.close()
+        raise RuntimeError("default-route interfaces have no private IPv4 address")
+    except (OSError, ValueError, IndexError) as exc:
+        raise RuntimeError(f"could not discover primary private IPv4 address: {exc}") from exc
 
 
 def log_dns_query(source_ip: str, query_name: str, query_type: str,
@@ -311,12 +342,12 @@ class DNSRebindServer:
             sock.close()
             self.udp_executor.shutdown(wait=False)
 
-    def run_tcp(self):
+    def run_tcp(self, bind_ip: str):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((DNS_HOST, DNS_PORT))
+        sock.bind((bind_ip, DNS_PORT))
         sock.listen(MAX_WORKERS)
-        print(f"[REBIND] TCP Server listening on {DNS_HOST}:{DNS_PORT}")
+        print(f"[REBIND] TCP Server listening on {bind_ip}:{DNS_PORT}")
         try:
             while True:
                 conn, addr = sock.accept()
@@ -339,14 +370,20 @@ class DNSRebindServer:
             self.tcp_executor.shutdown(wait=False)
 
     def run(self):
+        try:
+            tcp_bind_ip = get_primary_private_ipv4()
+        except RuntimeError as exc:
+            print(f"[REBIND] FATAL: {exc}", file=sys.stderr, flush=True)
+            raise
         print("[REBIND] Starting DNS rebinding server")
         print(f"[REBIND] Public IP: {PUBLIC_IP}")
         print(f"[REBIND] Private IP: {PRIVATE_IP}")
         print(f"[REBIND] Test hostname: {REBIND_HOSTNAME}")
         print(f"[REBIND] State file: {self.state_file}")
+        print(f"[REBIND] TCP bind address: {tcp_bind_ip}")
 
         udp_thread = threading.Thread(target=self.run_udp, daemon=True, name="dns-udp-listen")
-        tcp_thread = threading.Thread(target=self.run_tcp, daemon=True, name="dns-tcp-listen")
+        tcp_thread = threading.Thread(target=self.run_tcp, args=(tcp_bind_ip,), daemon=True, name="dns-tcp-listen")
         udp_thread.start()
         tcp_thread.start()
         try:

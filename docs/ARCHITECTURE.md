@@ -33,7 +33,9 @@ The same parameter configures an isolated Nginx HTTP/HTTPS sink server block, a 
 
 ## Network layout
 
-One Ubuntu 24.04 EC2 host has public TCP 22 (admin CIDR), 53, 80, and 443. DNS is authoritative, non-recursive TCP+UDP 53. Nginx handles port 80 redirects and port 443 SNI routing. Loopback services are Flask `127.0.0.1:5000`, normal HTTPS proxy `127.0.0.1:8443`, slow TLS `127.0.0.1:9997`, malformed TLS `127.0.0.1:9998`, and malformed HTTP `127.0.0.1:9999`.
+One Ubuntu 24.04 EC2 host has public TCP 22 (operator-supplied admin CIDR), 53, 80, and 443. DNS is authoritative and non-recursive: UDP binds `0.0.0.0:53`, while TCP binds the primary private IPv4 address discovered from the kernel default route. This avoids systemd-resolved loopback TCP/53 listeners, and remains reachable through EIP/NAT; Paleon's public TCP/53 probe reaches the TCP service. Nginx handles port 80 redirects and port 443 SNI routing. Loopback services are Flask `127.0.0.1:5000`, normal HTTPS proxy `127.0.0.1:8443`, slow TLS `127.0.0.1:9997`, malformed TLS `127.0.0.1:9998`, and malformed HTTP `127.0.0.1:9999`.
+
+SAFE-006's 15-second held-response stimulus remains in the answer key and is executable using Paleon's running-scan Stop control; record the stop action, prompt termination, and absence of orphan processes or socket leaks.
 
 The Flask observation API is intentionally available only via direct localhost access on port 5000. Nginx returns 404 for that exact path on public HTTPS, avoiding trust in a proxied `remote_addr` value.
 

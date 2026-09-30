@@ -306,14 +306,12 @@ resilience_tests:
     category: termination_safety
     hostname: kill-test.paleon-lab-hostile.com
     stimulus: Streams initial greeting then holds connection for 15 seconds before closing
-    expected_behavior: Skipped for the current scan because Paleon does not yet provide a running-scan stop control. Execute this check once scan-stop control is available.
-    skipped: true
-    skip_reason: Paleon does not yet provide a running-scan stop control; execute SAFE-006 once that control is available.
+    expected_behavior: Invoke Paleon's running-scan Stop control during the 15-second hold and confirm prompt scan termination.
     severity: expected
     silent_expected: false
     finding_expected: false
-    evidence_required: When runnable, record controller stop action and confirm prompt process termination with zero orphan child processes or socket leaks.
-    termination_expectation: Skipped for the current scan; on execution, task is terminated by controller within hold period.
+    evidence_required: Record the controller Stop action and prompt scan termination, with zero orphan child processes or socket leaks.
+    termination_expectation: The controller terminates the task promptly within the 15-second hold period after Stop is invoked.
     claim: expected
 
   - id: SAFE-007

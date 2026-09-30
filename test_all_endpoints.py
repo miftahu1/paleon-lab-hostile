@@ -79,8 +79,8 @@ def build_client_hello(hostname: str) -> bytes:
     return b"\x16\x03\x01" + struct.pack("!H", len(handshake)) + handshake
 
 
-def recv_bounded(sock: socket.socket, n: int = 4096) -> bytes:
-    sock.settimeout(5.0)
+def recv_bounded(sock: socket.socket, n: int = 4096, timeout: float = 5.0) -> bytes:
+    sock.settimeout(timeout)
     chunks = bytearray()
     while len(chunks) < n:
         try:
@@ -281,7 +281,7 @@ def test_public_boundary(target_eip: str) -> None:
     try:
         start_slow = time.time()
         slow_sock.sendall(slow_hello)
-        slow_resp = recv_bounded(slow_sock)
+        slow_resp = recv_bounded(slow_sock, timeout=15.0)
         slow_elapsed = time.time() - start_slow
         assert slow_elapsed >= 8.0, f"Slow TLS handshake was too fast: {slow_elapsed}s"
     finally:
